@@ -1,0 +1,53 @@
+# 障碍物生成代码 - test_main.py
+
+## 位置: 第65-91行
+
+## 代码
+```python
+# ============================================
+# 生成2个静态NPC车辆作为障碍物（在路线上）
+# ============================================
+obs_positions = []
+
+if len(route) > 50:
+    obs_wp50, _ = route[50]
+    spawn_loc50 = carla.Location(
+        x=obs_wp50.transform.location.x,
+        y=obs_wp50.transform.location.y,
+        z=obs_wp50.transform.location.z + 0.5
+    )
+    obs_transform50 = carla.Transform(
+        location=spawn_loc50, 
+        rotation=obs_wp50.transform.rotation
+    )
+    env.spawn_obstacle_vehicle(obs_transform50)
+    obs_positions.append([spawn_loc50.x, spawn_loc50.y])
+
+if len(route) > 100:
+    obs_wp100, _ = route[100]
+    spawn_loc100 = carla.Location(
+        x=obs_wp100.transform.location.x,
+        y=obs_wp100.transform.location.y,
+        z=obs_wp100.transform.location.z + 0.5
+    )
+    obs_transform100 = carla.Transform(
+        location=spawn_loc100, 
+        rotation=obs_wp100.transform.rotation
+    )
+    env.spawn_obstacle_vehicle(obs_transform100)
+    obs_positions.append([spawn_loc100.x, spawn_loc100.y])
+
+obs_points = np.array(obs_positions) if obs_positions else None
+```
+
+## 传给Agent
+```python
+if obs_points is not None:
+    agent.set_obstacles(obs_points)
+```
+
+## 障碍物位置存储 (test_main.py 第227行)
+```python
+axs[0, 0].scatter(obs_points[:, 0], obs_points[:, 1], 
+    marker='x', s=200, c='red', label='Obstacle', zorder=6)
+```

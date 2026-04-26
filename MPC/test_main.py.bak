@@ -1,0 +1,254 @@
+"""
+test_main.py - MPC轨迹跟踪控制主测试脚本
+
+功能说明：
+    基于模型预测控制（MPC）的自动驾驶轨迹跟踪测试程序
+    在CARLA仿真环境中运行，记录并可视化车辆轨迹跟踪效果
+
+作者：[待填写]
+日期：[待填写]
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from src.mcp_controller import Vehicle
+from env import Env, draw_waypoints
+
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).with_name('src')))
+from src.x_v2x_agent import Xagent
+from src.global_route_planner import GlobalRoutePlanner
+
+import time
+import pygame
+
+# ============================================
+# 仿真参数配置
+# ============================================
+simu_step = 0.05      # 仿真步长（秒），即控制周期 50ms，对应控制频率 20Hz
+target_v = 40         # 目标车速（km/h），转换为m/s后为 40/3.6 ≈ 11.1 m/s
+sample_res = 2.0      # 全局路径规划的采样分辨率（米），越小路径越精确但计算量越大
+display_mode = "spec" # 显示模式："spec"=无渲染模式(省资源) 或 "pygame"=图形界面
+
+# ============================================
+# 环境初始化
+# ============================================
+env = Env(display_method=display_mode, dt=simu_step)  # 创建仿真环境
+env.clean()                                            # 清理之前可能存在的残留数据
+
+# 获取CARLA地图中所有可用的出生点（车辆可以停放的合法位置）
+spawn_points = env.map.get_spawn_points()
+
+# ============================================
+# 全局路径规划
+# ============================================
+# 起点和终点索引（对应CARLA地图中的出生点编号）
+start_idx, end_idx = 87, 70
+
+# 创建全局路径规划器，sample_res=2.0 表示路径采样间隔为2米
+grp = GlobalRoutePlanner(env.map, sample_res)
+
+# 从起点到终点计算一条全局参考路径
+route = grp.trace_route(spawn_points[start_idx].location, spawn_points[end_idx].location)
+
+# 在仿真环境中绘制参考路径（绿色，z=0.5表示抬高层高）
+draw_waypoints(env.world, [wp for wp, _ in route], z=0.5, color=(0, 255, 0))
+
+# 重置环境，将车辆放置在起点位置
+env.reset(spawn_point=spawn_points[start_idx])
+
+# ============================================
+# 构建路径点列表（用于后续参考轨迹匹配）
+# ============================================
+routes = []
+for wp, _ in route:
+    wp_t = wp.transform
+    routes.append([wp_t.location.x, wp_t.location.y])  # 提取每个路点的(x, y)坐标
+
+# ============================================
+# MPC控制器与Agent初始化
+# ============================================
+# 创建MPC控制器实例
+# 参数说明：
+#   - actor: CARLA中的被控车辆
+#   - horizon: 预测时域长度（10步 = 0.5秒），决定MPC"看多远"
+#   - target_v: 期望的纵向速度
+#   - delta_t: 控制周期，需与仿真步长一致
+#   - max_iter: IPOPT优化器最大迭代次数，影响求解精度与速度
+dynamic_model = Vehicle(
+    actor=env.ego_vehicle,
+    horizon=10,
+    target_v=target_v,
+    delta_t=simu_step,
+    max_iter=30
+)
+
+# 创建Agent（智能体），负责协调感知、规划、控制
+agent = Xagent(env, dynamic_model, dt=simu_step)
+
+# 设置起点和终点变换信息（用于后续到达判定）
+agent.set_start_end_transforms(start_idx, end_idx)
+
+# 规划局部轨迹（基于全局路径进行局部重规划）
+agent.plan_route(agent._start_transform, agent._end_transform)
+
+# ============================================
+# 仿真参数
+# ============================================
+sim_time = 0                            # 累计仿真时间（目前未使用）
+max_sim_steps = 2000                   # 最大仿真步数，2000步 × 0.05秒 = 100秒
+
+# ============================================
+# 数据记录变量（用于后续可视化）
+# ============================================
+trajectory = []     # 记录车辆实际行驶轨迹 (x, y)
+velocities = []     # 记录车辆速度变化曲线 (m/s)
+accelerations = []  # 记录车辆加速度变化曲线 (m/s²)
+steerings = []      # 记录车辆转向角变化曲线 (rad)
+times = []          # 记录对应的时间戳 (s)
+
+# ============================================
+# 初始化显示（仅pygame模式需要）
+# ============================================
+if env.display_method == "pygame":
+    env.init_display()
+
+# ============================================
+# 主仿真循环
+# ============================================
+try:
+    for step in range(max_sim_steps):
+        try:
+            # ----------------------------------
+            # MPC求解：调用Agent执行一步控制
+            # 返回值：加速度a_opt, 转向角delta_opt, 下一状态next_state
+            # ----------------------------------
+            a_opt, delta_opt, next_state = agent.run_step()
+
+            # 提取状态信息
+            x, y, yaw, vx, vy, omega = next_state[0]
+
+            # 记录本次控制后的数据
+            trajectory.append([x, y])      # 记录轨迹点
+            velocities.append(vx)           # 记录速度
+            accelerations.append(a_opt)     # 记录加速度
+            steerings.append(delta_opt)     # 记录转向角
+            times.append(step * simu_step)  # 记录当前时间
+
+            # ----------------------------------
+            # 向CARLA发送控制指令，执行控制
+            # ----------------------------------
+            env.step([a_opt, delta_opt])
+
+            # ----------------------------------
+            # Pygame图形界面更新（仅pygame模式）
+            # ----------------------------------
+            if env.display_method == "pygame":
+                # 更新HUD显示（速度、时间等信息）
+                env.hud.tick(env, env.clock)
+
+                if step == 0:
+                    env.display.fill((0, 0, 0))  # 首次清屏
+
+                env.hud.render(env.display)  # 渲染HUD
+                pygame.display.flip()         # 刷新显示
+                env.check_quit()             # 检查是否退出
+
+            # ----------------------------------
+            # 到达终点检测
+            # ----------------------------------
+            # 计算当前车辆与终点之间的距离
+            dist_to_goal = np.linalg.norm([
+                next_state[0][0] - agent._end_transform.location.x,
+                next_state[0][1] - agent._end_transform.location.y
+            ])
+
+            if dist_to_goal < 1.0:  # 距离小于1米认为到达终点
+                print("Destination reached!")  # 打印到达信息
+
+                if env.display_method == "pygame":
+                    pygame.quit()  # 关闭pygame窗口
+
+                sys.exit()  # 正常退出程序
+                break       # 退出仿真循环
+
+            # ----------------------------------
+            # 控制频率限制（仅pygame模式需要，spec模式无需sleep）
+            # ----------------------------------
+            if env.display_method == "pygame":
+                time.sleep(simu_step)  # 控制20Hz频率，避免过快
+
+        except Exception as e:
+            # 遇到异常打印警告并继续（容忍少量错误）
+            print(f"Warning: {e}")
+            break
+
+except KeyboardInterrupt:
+    # 用户手动Ctrl+C中断仿真
+    print("Simulation interrupted by user.")
+
+# ============================================
+# 数据后处理：转换为numpy数组
+# ============================================
+trajectory = np.array(trajectory)
+velocities = np.array(velocities)
+accelerations = np.array(accelerations)
+steerings = np.array(steerings)
+times = np.array(times)
+
+# ============================================
+# 结果可视化：四宫格图
+# ============================================
+fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+
+# ----- 左上：轨迹对比图 -----
+axs[0, 0].plot(trajectory[:, 0], trajectory[:, 1],
+               label="Vehicle Path", color='darkorange', linewidth=2)  # 实际轨迹
+axs[0, 0].scatter(agent._start_transform.location.x,
+                  agent._start_transform.location.y,
+                  color='green', label="Start", zorder=5)  # 起点标记
+axs[0, 0].scatter(agent._end_transform.location.x,
+                  agent._end_transform.location.y,
+                  color='red', label="End", zorder=5)  # 终点标记
+
+# 绘制参考路径（蓝色虚线）
+route_points = np.array([[wp.transform.location.x, wp.transform.location.y]
+                         for wp, _ in route])
+axs[0, 0].plot(route_points[:, 0], route_points[:, 1],
+               '--', color='blue', label="Planned Route", alpha=0.6)
+axs[0, 0].set_title("Vehicle Path and Planned Route", fontsize=14)
+axs[0, 0].set_xlabel("X Position", fontsize=12)
+axs[0, 0].set_ylabel("Y Position", fontsize=12)
+axs[0, 0].legend(loc='upper left', fontsize=10)
+axs[0, 0].grid(True)
+
+# ----- 右上：速度曲线 -----
+axs[0, 1].plot(times, velocities,
+               label="Velocity (m/s)", color='royalblue', linewidth=2)
+axs[0, 1].set_title("Velocity over Time", fontsize=14)
+axs[0, 1].set_xlabel("Time (s)", fontsize=12)
+axs[0, 1].set_ylabel("Velocity (m/s)", fontsize=12)
+axs[0, 1].legend(loc='upper right', fontsize=10)
+axs[0, 1].grid(True)
+
+# ----- 左下：加速度曲线 -----
+axs[1, 0].plot(times, accelerations,
+               label="Acceleration (m/s²)", color='orange', linewidth=2)
+axs[1, 0].set_title("Acceleration over Time", fontsize=14)
+axs[1, 0].set_xlabel("Time (s)", fontsize=12)
+axs[1, 0].set_ylabel("Acceleration (m/s²)", fontsize=12)
+axs[1, 0].legend(loc='upper right', fontsize=10)
+axs[1, 0].grid(True)
+
+# ----- 右下：转向角曲线 -----
+axs[1, 1].plot(times, steerings,
+               label="Steering Angle (rad)", color='green', linewidth=2)
+axs[1, 1].set_title("Steering Angle over Time", fontsize=14)
+axs[1, 1].set_xlabel("Time (s)", fontsize=12)
+axs[1, 1].set_ylabel("Steering Angle (rad)", fontsize=12)
+axs[1, 1].legend(loc='upper right', fontsize=10)
+axs[1, 1].grid(True)
+
+# 调整布局并显示
+plt.tight_layout()
+plt.show()

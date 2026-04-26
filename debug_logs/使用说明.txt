@@ -1,0 +1,60 @@
+# 调试日志说明
+
+## 日志文件位置
+`C:\Users\Administrator\Desktop\carla_MPC-main2\carla_MPC-main2\debug_logs\run_debug.log`
+
+## 运行前清理
+运行测试前建议清空日志文件：
+- 删除 `run_debug.log` 文件
+
+## 运行后查看
+测试完成后，打开 `run_debug.log` 查看调试信息
+
+## 关键检查点
+
+### 1. 障碍物是否传递
+```
+[DEBUG] 障碍物数量: 2, 位置: [[x1, y1], [x2, y2]]
+```
+如果显示 `无障碍物`，说明 set_obstacles() 没被调用
+
+### 2. 软约束是否添加
+```
+[DEBUG solver_add_soft_obs] n_obs=2, ratio=800
+[DEBUG solver_add_soft_obs] 惩罚项添加完成
+```
+
+### 3. 求解是否成功
+```
+[DEBUG solve_MPC] 求解状态: True/False
+```
+
+### 4. 控制输出
+```
+[DEBUG] a_opt: -0.123, delta_opt: 0.456
+[DEBUG] 下一状态: x=100.5, y=200.3, v=5.2
+```
+- a_opt 是加速度（负值=减速，正值=加速）
+- delta_opt 是转向角
+- v 是速度
+
+## 异常情况
+
+### 情况1: 无障碍物
+- 检查 test_main.py 中 obs_points 是否生成
+- 检查 agent.set_obstacles() 是否被调用
+
+### 情况2: a_opt=0, delta_opt=0
+- 说明求解器没有输出有效控制
+- 可能是求解失败
+
+### 情况3: 求解状态=False
+- 约束可能太严格
+- 检查 lbg, ubg 边界
+
+### 情况4: 速度持续下降
+- a_opt 持续为负值
+- 说明避障惩罚在持续生效
+
+## 日志格式
+每次 run_step() 调用会写入约5行日志

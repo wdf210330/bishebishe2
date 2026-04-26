@@ -1,0 +1,488 @@
+"""
+x_v2x_agent.py - MPC轨迹跟踪Agent
+
+功能说明：
+    基于MPC控制器的自动驾驶轨迹跟踪Agent
+    继承自BasicAgent，负责协调全局路径规划、局部轨迹生成和MPC控制求解
+    是test_main.py与MPC控制器之间的"桥梁"
+
+核心流程：
+    1. 从全局路径中提取参考路径点
+    2. 三次样条插值生成平滑路径
+    3. 基于当前速度和预测时域计算参考轨迹
+    4. 调用MPC控制器求解最优控制
+    5. 返回控制指令给test_main.py执行
+
+作者：[待填写]
+日期：[待填写]
+"""
+
+#!/usr/bin/env python
+
+import os
+import sys
+
+# 添加路径以导入official和utils模块
+try:
+    sys.path.append(os.path.join(
+                    os.path.dirname(
+                        os.path.dirname(os.path.abspath(__file__))), 'official'))
+    sys.path.append(os.path.join(
+                    os.path.dirname(
+                        os.path.dirname(os.path.abspath(__file__))), 'utils'))
+except IndexError:
+    pass
+
+import copy
+import carla
+import math
+import numpy as np
+import interpolate as itp  # 三次样条插值模块
+import carla_utils as ca_u  # CARLA工具函数
+from enum import Enum
+from collections import deque
+from basic_agent import BasicAgent
+from global_route_planner import GlobalRoutePlanner
+
+import matplotlib.pyplot as plt
+import time
+
+
+class RoadOption(Enum):
+    """
+    道路拓扑选项枚举
+    
+    表示车辆从当前车道到下一车道的拓扑关系：
+    - VOID: 无效/空
+    - LEFT: 左转
+    - RIGHT: 右转
+    - STRAIGHT: 直行
+    - LANEFOLLOW: 车道保持（默认）
+    - CHANGELANELEFT: 换道至左侧
+    - CHANGELANERIGHT: 换道至右侧
+    """
+    VOID = -1
+    LEFT = 1
+    RIGHT = 2
+    STRAIGHT = 3
+    LANEFOLLOW = 4
+    CHANGELANELEFT = 5
+    CHANGELANERIGHT = 6
+
+
+class Xagent(BasicAgent):
+    """
+    MPC轨迹跟踪Agent
+    
+    继承自BasicAgent，负责：
+    - 管理全局路径队列
+    - 生成局部参考轨迹
+    - 调用MPC控制器求解
+    - 处理坐标转换
+    
+    属性：
+        _env: 仿真环境对象
+        _vehicle: CARLA车辆
+        _model: MPC控制器（Vehicle对象）
+        _waypoints_queue: 全局路径点队列（deque结构）
+        _a_opt: 上一时刻求解的加速度序列
+        _delta_opt: 上一时刻求解的转向角序列
+    """
+    
+    def __init__(self, env, model, dt=0.1) -> None:
+        """
+        初始化Xagent
+        
+        参数：
+            env: Env环境对象
+            model: Vehicle（MPC控制器）对象
+            dt: 控制时间步长（秒）
+        """
+        self._env = env
+        self._vehicle = env.ego_vehicle  # 被控车辆
+        self._model = model
+        
+        self._world = self._vehicle.get_world()
+        self._map = self._world.get_map()
+
+        # -------------------------------------------
+        # 路径跟踪参数
+        # -------------------------------------------
+        self._base_min_distance = 2.0  # 基础最小跟车距离（米）
+        self._waypoints_queue = deque(maxlen=100000)  # 路径点队列
+        self._d_dist = 0.4  # 路径采样距离（米）
+        self._sample_resolution = 2.0  # 全局路径采样分辨率（米）
+        
+        # -------------------------------------------
+        # MPC求解状态（用于热启动）
+        # -------------------------------------------
+        self._a_opt = np.array([0.0] * self._model.horizon)      # 最优加速度序列
+        self._delta_opt = np.array([0.0] * self._model.horizon)  # 最优转向角序列
+        self._dt = dt
+        
+        # -------------------------------------------
+        # 状态跟踪
+        # -------------------------------------------
+        self._next_states = None          # 预测的下一状态序列
+        self._last_traffic_light = None   # 上一个交通信号灯
+        self._last_traffic_waypoint = None  # 上一个交通灯位置
+        
+        # -------------------------------------------
+        # MPC代价函数权重（可调整）
+        # -------------------------------------------
+        # Q: 状态跟踪权重，[x, y, yaw, vx]的重要性
+        self._model.solver_basis(Q=np.diag([10, 10, 10, 1.5, 0.1]), Rd=np.diag([1.0, 1000.0]))
+        self.Q_origin = copy.deepcopy(self._model.Q)  # 保存原始权重
+        self._log_data = []  # 数据记录（用于后续分析）
+        self._simu_time = 0  # 累计仿真时间
+        
+        # -------------------------------------------
+        # 全局路径规划器
+        # -------------------------------------------
+        self._global_planner = GlobalRoutePlanner(self._map, self._sample_resolution)
+        
+        # 路径点移动距离计算参数
+        self.dist_move = 0.2   # 初始移动距离
+        self.dist_step = 1.5  # 距离步长系数
+    
+    def plan_route(self, start_location, end_location):
+        """
+        规划全局路径
+        
+        从起点到终点计算全局路径，并将路径点加入队列
+        
+        参数：
+            start_location: 起点CARLA Location
+            end_location: 终点CARLA Location
+        """
+        self._route = self.trace_route(start_location.location, end_location.location)
+        # 将路径点加入队列
+        for i in self._route:
+            self._waypoints_queue.append(i)
+    
+    def set_start_end_transforms(self, start_idx, end_idx):
+        """
+        设置起点和终点的Transform（通过spawn point索引）
+        
+        参数：
+            start_idx: 起点spawn point索引
+            end_idx: 终点spawn point索引
+        
+        异常：
+            IndexError: 索引超出范围时抛出
+        """
+        spawn_points = self._map.get_spawn_points()  # 获取所有spawn points
+        if start_idx < len(spawn_points) and end_idx < len(spawn_points):
+            self._start_transform = spawn_points[start_idx]
+            self._end_transform = spawn_points[end_idx]
+        else:
+            raise IndexError("Start or end index out of bounds!")
+    
+    def calc_ref_trajectory_in_T_step(self, node, ref_path, sp):
+        """
+        计算T步预测时域内的参考轨迹
+        
+        根据当前速度和预测时域，在参考路径上采样T+1个点作为MPC的参考轨迹
+        
+        参数：
+            node: 当前状态 [x, y, v, yaw]
+            ref_path: 参考路径对象（含cx, cy, cyaw等）
+            sp: 速度剖面（速度随路程变化的曲线）
+        
+        返回：
+            z_ref: 参考轨迹 [4, T+1]，包含[x, y, v, yaw]
+            ind: 当前路径点索引
+        """
+        T = self._model.horizon  # 预测时域长度
+        z_ref = np.zeros((4, T + 1))  # 初始化参考轨迹
+        
+        # 找到参考路径上距离当前状态最近的点
+        length = ref_path.length
+        ind, _ = ref_path.nearest_index(node)
+        
+        # 第一个点：最近邻点
+        z_ref[0, 0] = ref_path.cx[ind]
+        z_ref[1, 0] = ref_path.cy[ind]
+        z_ref[2, 0] = sp[ind]  # 速度
+        z_ref[3, 0] = ref_path.cyaw[ind]  # 航向角
+        
+        # -------------------------------------------
+        # 沿路径前向采样T个点
+        # -------------------------------------------
+        dist_move = copy.copy(self.dist_move)
+        
+        for i in range(1, T + 1):
+            # 根据当前速度计算移动距离
+            # 速度越大，采样点越远（自适应采样）
+            dist_move += self.dist_step * abs(self._model.get_v()) * self._dt
+            ind_move = int(round(dist_move / self._d_dist))
+            index = min(ind + ind_move, length - 1)  # 防止越界
+            
+            # 提取参考状态
+            z_ref[0, i] = ref_path.cx[index]
+            z_ref[1, i] = ref_path.cy[index]
+            z_ref[2, i] = sp[index]
+            z_ref[3, i] = ref_path.cyaw[index]
+        
+        return z_ref, ind
+    
+    def rotate(self, x, y, theta, ratio=1.75):
+        """
+        坐标旋转（绕原点旋转theta角度）
+        
+        用于计算车辆相对路径点的横向距离
+        
+        参数：
+            x, y: 原始坐标
+            theta: 旋转角度（弧度）
+            ratio: 缩放比例
+        
+        返回：
+            旋转后的坐标 [x', y']
+        """
+        return np.array([
+            (x * np.cos(theta) - y * np.sin(theta)) * ratio,
+            (x * np.sin(theta) + y * np.cos(theta)) * ratio
+        ])
+    
+    def lat_dis_wp_ev(self, wp, ev):
+        """
+        计算路径点与车辆之间的横向距离
+        
+        用于车道保持等功能的误差计算
+        
+        参数：
+            wp: 路径点Waypoint
+            ev: 车辆Actor
+        
+        返回：
+            横向距离（米）
+        """
+        # 提取位置
+        wp_loc = np.array([wp.transform.location.x, wp.transform.location.y])
+        ev_loc = np.array([ev.get_location().x, ev.get_location().y])
+        
+        # 旋转到路径点局部坐标系
+        wp_yaw = wp.transform.rotation.yaw
+        wp_loc = self.rotate(wp_loc[0], wp_loc[1], np.deg2rad(wp_yaw))
+        ev_loc = self.rotate(ev_loc[0], ev_loc[1], np.deg2rad(wp_yaw))
+        
+        # 返回y方向的距离（横向）
+        return np.abs(wp_loc[1] - ev_loc[1])
+    
+    def run_step(self, lv=None):
+        """
+        执行一步控制（核心方法，每个控制周期调用一次）
+        
+        流程：
+            1. 获取当前车辆状态
+            2. 更新路径点队列（移除已通过的）
+            3. 插值生成平滑参考路径
+            4. 计算T步参考轨迹
+            5. 调用MPC求解最优控制
+            6. 绘制预测轨迹（可视化）
+            7. 返回控制指令
+        
+        返回：
+            (a_opt, delta_opt, next_state): 加速度、转向角、下一状态
+        """
+        # 累计仿真时间
+        self._simu_time += self._dt
+        
+        # -------------------------------------------
+        # 1. 获取当前车辆状态
+        # -------------------------------------------
+        state, height = self._model.get_state_carla()  # 从CARLA获取状态
+        # 坐标转换：CARLA坐标系 -> 右手坐标系
+        current_state = np.array(ca_u.carla_vector_to_rh_vector(
+            state[0:2], state[2], state[3:]
+        ))
+        
+        # -------------------------------------------
+        # 2. 动态计算最小跟车距离
+        # -------------------------------------------
+        veh_location = self._vehicle.get_location()
+        vehicle_speed = self._model.get_v()
+        # 速度越大，最小跟车距离越大（安全考虑）
+        self._min_distance = self._base_min_distance + 0.5 * vehicle_speed
+        
+        # -------------------------------------------
+        # 3. 获取参考路径点
+        # -------------------------------------------
+        if len(self._waypoints_queue) == 0:
+            raise Exception("No waypoints to follow")
+        else:
+            carla_wp, _ = np.array(self._waypoints_queue).T
+            waypoints = []
+            v = math.sqrt(current_state[3]**2 + current_state[4]**2)  # 合成速度
+            waypoints.append([current_state[0], current_state[1], v, current_state[2]])
+            cnt = 0
+            
+            # -------------------------------------------
+            # 简化路径点（避免插值NaN）
+            # 只保留前30个点，减少计算量
+            # 同时去除距离过近的重复点
+            # -------------------------------------------
+            last_state = None
+            for wp in carla_wp:
+                if cnt > 30:
+                    break
+                cnt += 1
+                t = wp.transform
+                ref_state = ca_u.carla_vector_to_rh_vector(
+                    [t.location.x, t.location.y], t.rotation.yaw
+                )
+                if last_state is not None:
+                    # 距离太近的路径点会导致三次样条插值出现NaN
+                    if np.sqrt(ref_state[0]**2 + ref_state[1]**2) - last_state < 0.005:
+                        continue
+                waypoints.append([
+                    ref_state[0], ref_state[1],
+                    self._model.target_v, ref_state[2]
+                ])
+                last_state = np.sqrt(ref_state[0]**2 + ref_state[1]**2)
+            
+            waypoints = np.array(waypoints).T
+        
+        # -------------------------------------------
+        # 4. 移除已通过的路径点
+        # -------------------------------------------
+        num_waypoint_removed = 0
+        for waypoint, _ in self._waypoints_queue:
+            # 最后一个点要特殊处理（快到了才移除）
+            if len(self._waypoints_queue) - num_waypoint_removed == 1:
+                min_distance = 1
+            else:
+                min_distance = self._min_distance
+            
+            # 如果车辆已经到达该路径点，移除它
+            if veh_location.distance(waypoint.transform.location) < min_distance:
+                num_waypoint_removed += 1
+            else:
+                break
+        
+        # 从队列左侧（队首）移除已通过的路径点
+        if num_waypoint_removed > 0:
+            for _ in range(num_waypoint_removed):
+                self._waypoints_queue.popleft()
+        
+        # -------------------------------------------
+        # 5. 三次样条插值生成平滑路径
+        # -------------------------------------------
+        cx, cy, cyaw, ck, s = itp.calc_spline_course_carla(
+            waypoints[0], waypoints[1], waypoints[3][0], ds=self._d_dist
+        )
+        # 根据路径曲率生成速度剖面
+        sp = itp.calc_speed_profile(cx, cy, cyaw, self._model.target_v)
+        
+        # 封装为路径对象
+        ref_path = itp.PATH(cx, cy, cyaw, ck)
+        
+        # -------------------------------------------
+        # 6. 计算T步参考轨迹
+        # -------------------------------------------
+        z_ref, target_ind = self.calc_ref_trajectory_in_T_step(
+            [current_state[0], current_state[1], v, current_state[2]],
+            ref_path, sp
+        )
+        
+        # 转换为MPC需要的状态格式 [x, y, yaw, vx, vy, omega]
+        ref_traj = np.array([
+            z_ref[0], z_ref[1], z_ref[3], z_ref[2],  # x, y, yaw, v
+            [0] * len(z_ref[0]),  # vy = 0
+            [0] * len(z_ref[0])   # omega = 0
+        ])[:, :self._model.horizon]
+        
+        # -------------------------------------------
+        # 7. MPC求解
+        # -------------------------------------------
+        if self._next_states is None:
+            self._next_states = np.zeros(
+                (self._model.n_states, self._model.horizon + 1)
+            ).T
+        
+        # 更新当前速度
+        cur_v = self._model.get_v()
+        self._next_states[:, 3] = cur_v
+        current_state[3:] = self._next_states[0][3:]
+        
+        # 使用上一时刻的控制序列作为热启动
+        u0 = np.array([self._a_opt, self._delta_opt]).reshape(-1, 2).T
+        
+        # 初始化next_states（如果为空）
+        if self._next_states is None:
+            self._next_states = np.zeros(
+                (self._model.n_states, self._model.horizon + 1)
+            ).T
+        
+        # 添加势场代价（障碍物、道路边界等，目前为0）
+        apf_obs = apf_nc_road = apf_c_road = 0
+        
+        # 构建MPC优化问题
+        self._model.solver_add_cost()
+        self._model.solver_add_bounds()  # u00 = u0[:, 0])
+        
+        # 求解MPC
+        tick = time.time()
+        state = self._model.solve_MPC(
+            ref_traj.T, current_state, self._next_states, u0
+        )
+        time_2 = time.time() - tick
+        
+        # -------------------------------------------
+        # 8. 可视化预测轨迹（调试用）
+        # -------------------------------------------
+        # 绘制参考轨迹（绿色点）
+        ca_u.draw_planned_trj(self._world, ref_traj[:2, :].T, height + 0.5)
+        # 绘制预测轨迹（青色点）
+        ca_u.draw_planned_trj(
+            self._world, state[2][:, :2], height + 0.5, color=(0, 233, 222)
+        )
+        
+        # 保存预测状态序列（用于下一时刻热启动）
+        self._next_states = state[2]
+        
+        # -------------------------------------------
+        # 9. 准备返回数据
+        # -------------------------------------------
+        next_state = state[2][1]
+        self._a_opt = state[0]     # 更新最优加速度序列
+        self._delta_opt = state[1]  # 更新最优转向角序列
+        
+        # 用动力学模型预测实际下一状态
+        next_state = self._model.predict(
+            current_state, (self._a_opt[0], self._delta_opt[0])
+        )
+        self._model.set_state(next_state)  # 更新模型内部状态
+        
+        # -------------------------------------------
+        # 10. 计算跟踪误差（用于日志/调试）
+        # -------------------------------------------
+        dist_error = math.hypot(
+            next_state[0] - ref_traj[0, 1],
+            next_state[1] - ref_traj[1, 1] - self.dist_move
+        )
+        yaw_error = abs(next_state[2] - ref_traj[2, 1])
+        vel_error = abs(state[2][0][3] - ref_traj[3, 0])
+        
+        # 当前控制输出
+        acc = self._a_opt[0]
+        steer = self._delta_opt[0]
+        
+        # 求解耗时
+        cost_time = state[-1]
+        
+        return self._a_opt[0], self._delta_opt[0], (next_state, height + 0.05)
+    
+    def trace_route(self, start_location, end_location):
+        """
+        调用全局路径规划器计算路径
+        
+        参数：
+            start_location: 起点Location
+            end_location: 终点Location
+        
+        返回：
+            路径（Waypoint, RoadOption）列表
+        """
+        return self._global_planner.trace_route(start_location, end_location)

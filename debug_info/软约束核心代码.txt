@@ -1,0 +1,50 @@
+# 软约束核心代码 - mcp_controller.py
+
+## solver_add_soft_obs() 位置: 第559-590行
+
+```python
+def solver_add_soft_obs(self, obs=None, ratio=500, expn=1):
+    """
+    添加软障碍物避让约束（通过惩罚项方式）
+    
+    在代价函数中添加障碍物避让惩罚项，距离越近惩罚越大
+    不会导致无解，但也不保证100%避障
+    
+    参数：
+        obs: 障碍物位置列表，每个元素 [x, y]
+        ratio: 惩罚系数，越大越激进避障
+        expn: 惩罚指数
+    """
+    if obs is None or (isinstance(obs, list) and len(obs) == 0):
+        return
+    
+    obs = np.array(obs)  # 转为numpy数组
+    n_obs = obs.shape[0]
+    
+    for j in range(n_obs):  # 每个障碍物
+        obs_x, obs_y = obs[j, 0], obs[j, 1]
+        for i in range(self.horizon):  # 每个预测步
+            # 车辆位置与障碍物的欧氏距离
+            dx = self.X[0, i] - obs_x
+            dy = self.X[1, i] - obs_y
+            dist = ca.sqrt(dx**2 + dy**2)
+            
+            # 软惩罚项：距离越近，惩罚越大
+            self.obj += 12 * ((1 / dist - 0.5) ** expn) * ratio / (i + 1)
+```
+
+## 调用位置 - x_v2x_agent.py 第480-484行
+
+```python
+# 构建MPC优化问题
+self._model.solver_add_cost()        # 1. 定义代价函数
+self._model.solver_add_soft_obs(self._obstacles)  # 2. 添加软障碍物避让约束
+self._model.solver_add_bounds()       # 3. 添加边界约束
+```
+
+## 公式解释
+- dist: 车辆当前位置到障碍物的距离
+- 1/dist: 距离越近越大
+- 1/dist - 0.5: 当dist<2时为正，产生惩罚
+- ratio: 惩罚强度权重
+- i+1: 时间衰减，越远的预测步权重越小
