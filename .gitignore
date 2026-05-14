@@ -5,8 +5,4 @@ __pycache__/
 *.pyo
 *.pyd
 
-debug_logs/
-result/
-replay_pid*.log
-
 *.bak
