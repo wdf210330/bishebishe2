@@ -1,0 +1,61 @@
+{
+  "display_name": "Town05 受阻条件下的择机变道",
+  "carla_map": "Town05",
+  "start_idx": 299,
+  "end_idx": 62,
+  "arrival_distance_m": 3.0,
+  "target_v_kmh": 20.0,
+  "sample_res": 2.0,
+  "trajectory_xlim": [
+    -225,
+    150
+  ],
+  "trajectory_ylim": [
+    -15,
+    12
+  ],
+  "force_reload_world": true,
+  "route_draw_life_time": 3600.0,
+  "draw_route_debug": true,
+  "enable_obstacle_avoidance": true,
+  "enable_obstacle_reference_shaping": true,
+  "dynamic_vehicle_follow_buffer": 1.2,
+  "dynamic_vehicle_follow_time_headway": 0.3,
+  "dynamic_vehicle_follow_clearance_margin": 0.85,
+  "dynamic_vehicle_follow_speed_deficit_gain": 1.05,
+  "dynamic_vehicle_follow_max_slowdown": 1.15,
+  "dynamic_follow_gate_clearance": 12.0,
+  "dynamic_lane_change_front_gap": 11.0,
+  "dynamic_lane_change_rear_gap": 4.0,
+  "dynamic_overtake_return_front_clearance_lengths": 3.0,
+  "dynamic_overtake_return_distance": 28.0,
+  "dynamic_obstacle_safe_margin": 0.5,
+  "dynamic_obstacle_influence_margin": 0.45,
+  "dynamic_obstacle_distance_weight_scale": 1.5,
+  "dynamic_obstacle_violation_weight_scale": 2.1,
+  "spawn_static_obstacles": false,
+  "static_obstacle_route_groups": [],
+  "static_obstacles": [],
+  "pedestrian_crossings": [],
+  "scripted_vehicle_obstacles": [
+    {
+      "route_index": 28,
+      "start_lateral_offset": 0.0,
+      "end_lateral_offset": 0.0,
+      "start_time": 0.0,
+      "trigger_distance": 32.0,
+      "duration": 120.0,
+      "speed_kmh": 12.0
+    },
+    {
+      "route_index": 43,
+      "start_lateral_offset": 3.5,
+      "end_lateral_offset": 3.5,
+      "start_time": 0.0,
+      "trigger_distance": 16.0,
+      "duration": 120.0,
+      "speed_kmh": 11.0,
+      "motion_type": "offset_follow"
+    }
+  ]
+}

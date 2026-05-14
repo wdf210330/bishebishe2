@@ -1,0 +1,26 @@
+{
+  "display_name": "Town05 城市连续弯道跟踪",
+  "carla_map": "Town05",
+  "start_idx": 67,
+  "end_idx": 71,
+  "target_v_kmh": 18.0,
+  "sample_res": 2.0,
+  "trajectory_xlim": [
+    -140,
+    -35
+  ],
+  "trajectory_ylim": [
+    -100,
+    110
+  ],
+  "force_reload_world": true,
+  "route_draw_life_time": 3600.0,
+  "draw_route_debug": true,
+  "enable_obstacle_avoidance": false,
+  "enable_obstacle_reference_shaping": false,
+  "spawn_static_obstacles": false,
+  "static_obstacle_route_groups": [],
+  "static_obstacles": [],
+  "pedestrian_crossings": [],
+  "scripted_vehicle_obstacles": []
+}

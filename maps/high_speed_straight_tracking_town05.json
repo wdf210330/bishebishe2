@@ -1,0 +1,30 @@
+{
+  "display_name": "Town05 地面高速路线",
+  "carla_map": "Town05",
+  "start_idx": 170,
+  "end_idx": 200,
+  "require_route_completion": true,
+  "route_completion_distance_m": 0.5,
+  "route_completion_speed_mps": 0.5,
+  "arrival_distance_m": 10.0,
+  "target_v_kmh": 40.0,
+  "sample_res": 2.0,
+  "trajectory_xlim": [
+    -140,
+    110
+  ],
+  "trajectory_ylim": [
+    -100,
+    100
+  ],
+  "force_reload_world": true,
+  "route_draw_life_time": 3600.0,
+  "draw_route_debug": true,
+  "enable_obstacle_avoidance": false,
+  "enable_obstacle_reference_shaping": false,
+  "spawn_static_obstacles": false,
+  "static_obstacle_route_groups": [],
+  "static_obstacles": [],
+  "pedestrian_crossings": [],
+  "scripted_vehicle_obstacles": []
+}

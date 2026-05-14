@@ -1,0 +1,46 @@
+{
+  "display_name": "Town05 静态障碍绕行",
+  "carla_map": "Town05",
+  "start_idx": 170,
+  "end_idx": 200,
+  "route_end_index": 144,
+  "target_v_kmh": 20.0,
+  "sample_res": 2.0,
+  "trajectory_xlim": [
+    -135,
+    100
+  ],
+  "trajectory_ylim": [
+    -95,
+    110
+  ],
+  "force_reload_world": true,
+  "route_draw_life_time": 3600.0,
+  "draw_route_debug": true,
+  "enable_obstacle_avoidance": true,
+  "enable_obstacle_reference_shaping": true,
+  "spawn_static_obstacles": true,
+  "static_obstacle_route_groups": [
+    {
+      "start_index": 128,
+      "count": 1,
+      "step": 1,
+      "lateral_offset": 0.0
+    },
+    {
+      "start_index": 110,
+      "count": 2,
+      "step": 3,
+      "lateral_offset": 0.0
+    },
+    {
+      "start_index": 18,
+      "count": 1,
+      "step": 1,
+      "lateral_offset": 0.0
+    }
+  ],
+  "static_obstacles": [],
+  "pedestrian_crossings": [],
+  "scripted_vehicle_obstacles": []
+}

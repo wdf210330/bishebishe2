@@ -1,0 +1,76 @@
+{
+  "display_name": "Town05 窄通道通行",
+  "carla_map": "Town05",
+  "start_idx": 235,
+  "end_idx": 272,
+  "target_v_kmh": 10.0,
+  "sample_res": 2.0,
+  "trajectory_xlim": [
+    30,
+    220
+  ],
+  "trajectory_ylim": [
+    0,
+    220
+  ],
+  "force_reload_world": true,
+  "route_draw_life_time": 3600.0,
+  "draw_route_debug": true,
+  "enable_obstacle_avoidance": true,
+  "enable_obstacle_corridor_passage": true,
+  "enable_obstacle_reference_shaping": false,
+  "spawn_static_obstacles": true,
+  "static_obstacle_route_groups": [],
+  "static_obstacles": [
+    {
+      "route_index": 24,
+      "lateral_offset": -3.0
+    },
+    {
+      "route_index": 24,
+      "lateral_offset": 3.0
+    },
+    {
+      "route_index": 42,
+      "lateral_offset": -2.8
+    },
+    {
+      "route_index": 42,
+      "lateral_offset": 2.8
+    },
+    {
+      "route_index": 66,
+      "lateral_offset": -3.0
+    },
+    {
+      "route_index": 66,
+      "lateral_offset": 3.0
+    },
+    {
+      "route_index": 90,
+      "lateral_offset": -2.8
+    },
+    {
+      "route_index": 90,
+      "lateral_offset": 2.8
+    },
+    {
+      "route_index": 114,
+      "lateral_offset": -3.0
+    },
+    {
+      "route_index": 114,
+      "lateral_offset": 3.0
+    },
+    {
+      "route_index": 132,
+      "lateral_offset": -2.8
+    },
+    {
+      "route_index": 132,
+      "lateral_offset": 2.8
+    }
+  ],
+  "pedestrian_crossings": [],
+  "scripted_vehicle_obstacles": []
+}

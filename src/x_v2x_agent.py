@@ -1,633 +1,1719 @@
-"""
-x_v2x_agent.py - MPC轨迹跟踪Agent
-
-功能说明：
-    基于MPC控制器的自动驾驶轨迹跟踪Agent
-    继承自BasicAgent，负责协调全局路径规划、局部轨迹生成和MPC控制求解
-    是test_main.py与MPC控制器之间的"桥梁"
-
-核心流程：
-    1. 从全局路径中提取参考路径点
-    2. 三次样条插值生成平滑路径
-    3. 基于当前速度和预测时域计算参考轨迹
-    4. 调用MPC控制器求解最优控制
-    5. 返回控制指令给test_main.py执行
-
-作者：[待填写]
-日期：[待填写]
-"""
-
-#!/usr/bin/env python
-
-import os
-import sys
-
-# 添加路径以导入official和utils模块
-try:
-    sys.path.append(os.path.join(
-                    os.path.dirname(
-                        os.path.dirname(os.path.abspath(__file__))), 'official'))
-    sys.path.append(os.path.join(
-                    os.path.dirname(
-                        os.path.dirname(os.path.abspath(__file__))), 'utils'))
-except IndexError:
-    pass
-
-import copy
-import carla
 import math
-import numpy as np
-import interpolate as itp  # 三次样条插值模块
-import carla_utils as ca_u  # CARLA工具函数
-from enum import Enum
-from collections import deque
-from basic_agent import BasicAgent
-from global_route_planner import GlobalRoutePlanner
-
-import matplotlib.pyplot as plt
+import os
 import time
+from collections import deque
+
+import carla
+import numpy as np
+from scipy.interpolate import CubicSpline
+
+try:
+    from . import carla_utils as ca_u
+    from .global_route_planner import GlobalRoutePlanner
+    from .project_paths import ensure_debug_log_dir
+except ImportError:
+    import carla_utils as ca_u
+    from global_route_planner import GlobalRoutePlanner
+    from project_paths import ensure_debug_log_dir
 
 
-class RoadOption(Enum):
-    """
-    道路拓扑选项枚举
-    
-    表示车辆从当前车道到下一车道的拓扑关系：
-    - VOID: 无效/空
-    - LEFT: 左转
-    - RIGHT: 右转
-    - STRAIGHT: 直行
-    - LANEFOLLOW: 车道保持（默认）
-    - CHANGELANELEFT: 换道至左侧
-    - CHANGELANERIGHT: 换道至右侧
-    """
-    VOID = -1
-    LEFT = 1
-    RIGHT = 2
-    STRAIGHT = 3
-    LANEFOLLOW = 4
-    CHANGELANELEFT = 5
-    CHANGELANERIGHT = 6
-
-
-class Xagent(BasicAgent):
-    """
-    MPC轨迹跟踪Agent
-    
-    继承自BasicAgent，负责：
-    - 管理全局路径队列
-    - 生成局部参考轨迹
-    - 调用MPC控制器求解
-    - 处理坐标转换
-    
-    属性：
-        _env: 仿真环境对象
-        _vehicle: CARLA车辆
-        _model: MPC控制器（Vehicle对象）
-        _waypoints_queue: 全局路径点队列（deque结构）
-        _a_opt: 上一时刻求解的加速度序列
-        _delta_opt: 上一时刻求解的转向角序列
-    """
-    
+class Xagent:
     def __init__(self, env, model, dt=0.1) -> None:
-        """
-        初始化Xagent
-        
-        参数：
-            env: Env环境对象
-            model: Vehicle（MPC控制器）对象
-            dt: 控制时间步长（秒）
-        """
         self._env = env
-        self._vehicle = env.ego_vehicle  # 被控车辆
+        self._vehicle = env.ego_vehicle
         self._model = model
-        
         self._world = self._vehicle.get_world()
         self._map = self._world.get_map()
+        self._global_planner = GlobalRoutePlanner(self._map, 2.0)
 
-        # -------------------------------------------
-        # 误差滤波参数
-        # -------------------------------------------
-        self._dist_error_old = 0.0  # 上一时刻横向误差
-        self._dist_error_filtered = 0.0  # 滤波后横向误差
-        self._filter_alpha = 0.8  # 滤波系数（越大越保留新值，推荐0.7~0.9）
+        self._waypoints_queue = deque(maxlen=100000)
+        self._route = []
+        self._route_cache = None
+        self._route_start_index = 0
+        self._route_progress_s = 0.0
+        self._last_unwrapped_yaw = None
 
-        # -------------------------------------------
-        # 障碍物避让参数
-        # -------------------------------------------
-        self._obs_offset_dir = None  # 避让方向锁定（-1=右绕, 1=左绕, None=无锁定）
-        self._obs_offset_mag = None  # 避让偏移量大小
+        self._base_min_distance = 2.0
+        self._sample_resolution = 2.0
+        self._smooth_path_ds = 0.5
+        self._speed_profile_ds = 0.5
+        self._reference_yaw_window = 6.0
+        self._curvature_sample_window = 3.0
+        self._max_reference_lateral_accel = 0.8
+        self._reference_comfort_decel = 1.2
+        self._reference_comfort_accel = 0.8
+        self._min_curve_speed = 2.4
+        self._projection_min_lookahead = 15.0
+        self._projection_time_lookahead = 3.0
 
-        # -------------------------------------------
-        # 路径跟踪参数
-        # -------------------------------------------
-        self._base_min_distance = 2.0  # 基础最小跟车距离（米）
-        self._waypoints_queue = deque(maxlen=100000)  # 路径点队列
-        self._d_dist = 0.2  # 路径采样距离（米），减小以增加急弯处平滑度
-        self._sample_resolution = 2.0  # 全局路径采样分辨率（米）
-        
-        # -------------------------------------------
-        # MPC求解状态（用于热启动）
-        # -------------------------------------------
-        self._a_opt = np.array([0.0] * self._model.horizon)      # 最优加速度序列初始化，array([0., 0., 0., 0., 0.])
-        self._delta_opt = np.array([0.0] * self._model.horizon)  # 最优转向角序列
+        self._a_opt = np.array([0.0] * self._model.horizon)
+        self._delta_opt = np.array([0.0] * self._model.horizon)
+        self._last_control = np.array([0.0, 0.0], dtype=float)
+        self._next_states = None
         self._dt = dt
-        
-        # -------------------------------------------
-        # 状态跟踪
-        # -------------------------------------------
-        self._next_states = None          # 预测的下一状态序列
-        self._last_traffic_light = None   # 上一个交通信号灯
-        self._last_traffic_waypoint = None  # 上一个交通灯位置
-        self._obstacles = None           # 障碍物位置列表 (N x 2)
-        
-        # -------------------------------------------
-        # MPC代价函数权重（可调整）
-        # -------------------------------------------
-        # Q: 状态跟踪权重，[x, y, yaw, vx]的重要性
-        # R: 控制代价权重，[acc, steer]的重要性
-        # Rd: 控制平滑权重，抑制控制抖动
-        # 避障调整：适当降低速度权重，让绕行比刹车更划算
-        # 【修复振荡问题】降低Q权重，增大Rd转向平滑权重
-        # self._model.solver_basis(Q=np.diag([7, 7, 7, 7, 7]), R=np.diag([2, 2]), Rd=np.diag([2.0, 1000]))
-        # self._model.solver_basis(Q=np.diag([7, 7, 7, 7, 0]), R=np.diag([2, 1]), Rd=np.diag([1, 10]))
-        self._model.solver_basis(Q=np.diag([7, 7, 7, 7, 0]), R=np.diag([1, 2]), Rd=np.diag([0.5, 50]))
-        self.Q_origin = copy.deepcopy(self._model.Q)  # 保存原始权重，创建Q副本，方便后续调整
-        self._log_data = []  # 数据记录（用于后续分析）
-        self._simu_time = 0  # 累计仿真时间
-        
-        # -------------------------------------------
-        # 全局路径规划器
-        # -------------------------------------------
-        self._global_planner = GlobalRoutePlanner(self._map, self._sample_resolution)
-        
-        # 路径点移动距离计算参数
-        self.dist_move = 0.2   # 初始移动距离
-        self.dist_step = 1.5  # 距离步长系数
-    
+        self._draw_planned_trj = os.environ.get("MPC_DRAW_PLANNED_TRAJ", "0") == "1"
+        self._debug_log_enabled = os.environ.get("MPC_DEBUG_LOG", "0") == "1"
+
+        self._obstacles = None
+        self.enable_obstacle_avoidance = True
+        self.enable_obstacle_reference_shaping = True
+        self.obstacle_detection_range = 105.0
+        self._obstacle_reference_lateral_limit = 2.4
+        self._last_reference_speed = float(self._model.target_v)
+        self._last_min_obstacle_clearance = float("inf")
+        self._obstacle_bypass_speed = min(float(self._model.target_v), 12.0 / 3.6)
+        self._obstacle_speed_entry_distance = 22.0
+        self._obstacle_speed_exit_distance = 12.0
+        self._lane_bound_inactive = 1.0e6
+        self._pedestrian_safe_dist = 2.0
+        self._pedestrian_yield_distance = 12.0
+        self._pedestrian_path_half_width = 1.6
+        self._pedestrian_release_lateral = 2.1
+        self._pedestrian_stop_buffer = 2.3
+        self._pedestrian_crossing_lookahead_time = 3.0
+        self._pedestrian_min_decel = 0.25
+        self._pedestrian_comfort_decel = 0.7
+        self._pedestrian_strong_decel = 1.6
+        self._terminal_reference_speed = float(self._model.target_v)
+        self._route_completion_distance = 1.0
+        self._route_completion_speed = 0.8
+        self._preserve_terminal_waypoint = False
+        self._dynamic_vehicle_prediction_time = 3.0
+        self._dynamic_vehicle_conflict_lateral = 1.4
+        self._dynamic_vehicle_watch_lateral = 4.5
+        self._dynamic_vehicle_yield_distance = 28.0
+        self._dynamic_vehicle_time_headway = 1.6
+        self._dynamic_vehicle_stop_buffer = 5.0
+        self._dynamic_vehicle_reference_decel = 2.3
+        self._dynamic_vehicle_safe_dist = 1.8
+        self._dynamic_vehicle_min_decel = 0.3
+        self._dynamic_vehicle_comfort_decel = 1.1
+        self._dynamic_vehicle_strong_decel = 3.2
+        self._dynamic_vehicle_crawl_speed = 1.2
+        self._dynamic_vehicle_follow_buffer = 0.8
+        self._dynamic_vehicle_follow_time_headway = 0.20
+        self._dynamic_vehicle_follow_clearance_margin = 0.65
+        self._dynamic_vehicle_follow_speed_deficit_gain = 0.85
+        self._dynamic_vehicle_follow_max_slowdown = 1.0
+        self._dynamic_overtake_same_lane_lateral = 1.75
+        self._dynamic_overtake_min_speed_delta = 0.8
+        self._dynamic_overtake_start_distance = 20.0
+        self._dynamic_overtake_full_distance = 6.5
+        self._dynamic_overtake_return_front_clearance_lengths = 1.2
+        self._dynamic_overtake_return_distance = 14.0
+        self._dynamic_vehicle_rear_release_clearance = 1.0
+        self._dynamic_follow_gate_clearance = 16.0
+        self._dynamic_lane_change_front_gap = 14.0
+        self._dynamic_lane_change_rear_gap = 6.0
+        self._dynamic_lane_change_target_lane_tolerance = 1.6
+
+        self._model.solver_basis(
+            Q=np.diag([10, 10, 8, 6, 0]),
+            R=np.diag([1, 2]),
+            Rd=np.diag([0.5, 60]),
+        )
+        self._model.initialize_solver()
+
     def plan_route(self, start_location, end_location):
-        """
-        规划全局路径
-        
-        从起点到终点计算全局路径，并将路径点加入队列，（有长度限制）
-        
-        参数：
-            start_location: 起点CARLA Location
-            end_location: 终点CARLA Location
-        """
-        self._route = self.trace_route(start_location.location, end_location.location)
-        # 将路径点加入队列
-        for i in self._route:
-            self._waypoints_queue.append(i)
-    
+        route = self.trace_route(start_location.location, end_location.location)
+        self.set_route(route)
+
+    def trace_route(self, start_location, end_location):
+        return self._global_planner.trace_route(start_location, end_location)
+
     def set_start_end_transforms(self, start_idx, end_idx):
-        """
-        设置起点和终点的Transform（通过spawn point索引）
-        
-        参数：
-            start_idx: 起点spawn point索引
-            end_idx: 终点spawn point索引
-        
-        异常：
-            IndexError: 索引超出范围时抛出
-        """
-        spawn_points = self._map.get_spawn_points()  # 获取所有spawn points
+        spawn_points = self._map.get_spawn_points()
         if start_idx < len(spawn_points) and end_idx < len(spawn_points):
             self._start_transform = spawn_points[start_idx]
             self._end_transform = spawn_points[end_idx]
-        else:
-            raise IndexError("Start or end index out of bounds!")
-    
+            return
+        raise IndexError("Start or end index out of bounds!")
+
+    def set_route(self, route):
+        self._route = list(route)
+        self._waypoints_queue.clear()
+        for item in self._route:
+            self._waypoints_queue.append(item)
+        self._route_start_index = 0
+        self._route_progress_s = 0.0
+        self._last_unwrapped_yaw = None
+        self._route_cache = self._build_route_cache(self._route)
+
     def set_obstacles(self, obstacles):
-        """
-        设置障碍物位置
-        
-        参数：
-            obstacles: N x 2 数组，每行是 [x, y] 障碍物坐标
-        """
-        self._obstacles = obstacles
+        self._obstacles = np.asarray(obstacles, dtype=float) if obstacles is not None else None
 
-    def apply_obs_avoidance_offset(self, waypoints, ego_x, ego_y, ego_yaw):
-        """
-        不施加任何轨迹偏移，完全依靠势场法避障
-        
-        参数：
-            waypoints: np.array [4, N]，行分别是 [x, y, v, yaw]
-            ego_x, ego_y: 车辆当前位置
-            ego_yaw: 车辆当前航向角（弧度）
-            
-        返回：
-            原始waypoints数组（不做修改）
-        """
-        return waypoints
+    @staticmethod
+    def _normalize_angle(angle):
+        return math.atan2(math.sin(angle), math.cos(angle))
 
+    def _append_debug_log(self, message):
+        if not self._debug_log_enabled:
+            return
+        log_dir = ensure_debug_log_dir()
+        log_file = log_dir / "run_debug.log"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"{message}\n")
 
-    def calc_ref_trajectory_in_T_step(self, node, ref_path, sp):
-        """
-        计算T步预测时域内的参考轨迹
-        
-        根据当前速度和预测时域，在参考路径上采样T+1个点作为MPC的参考轨迹
-        
-        参数：
-            node: 当前状态 [x, y, v, yaw]
-            ref_path: 参考路径对象（含cx, cy, cyaw等）
-            sp: 速度剖面（速度随路程变化的曲线）
-        
-        返回：
-            z_ref: 参考轨迹 [4, T+1]，包含[x, y, v, yaw]
-            ind: 当前路径点索引
-        """
-        T = self._model.horizon  # 预测时域长度
-        z_ref = np.zeros((4, T + 1))  # 初始化参考轨迹，4行T+1列的零矩阵
-        
-        # 找到参考路径上距离当前状态最近的点，length轨迹点总数
-        length = ref_path.length
-        #找到参考路径上离车辆最近的点。
-        #输出含义ind 最近路径点在cx,cy 数组中的索引
-        #er 横向距离偏差（车辆偏左 / 偏右多少米）
-        ind, _ = ref_path.nearest_index(node)
-        
-        # 第一个点：最近邻点，4个参数放置在第一列
-        z_ref[0, 0] = ref_path.cx[ind]
-        z_ref[1, 0] = ref_path.cy[ind]
-        z_ref[2, 0] = sp[ind]  # 速度
-        z_ref[3, 0] = ref_path.cyaw[ind]  # 航向角
-        
-        # -------------------------------------------
-        # 沿路径前向采样T个点，# self.dist_move初始移动距离，self.dist_step距离步长系数
-        # -------------------------------------------
-        #copy.copy(self.dist_move) 就是"我需要用这个值，但我不想改掉原来的基准值"。
-        dist_move = copy.copy(self.dist_move)
-        
-        for i in range(1, T + 1):
-            # 根据当前速度计算移动距离
-            # 速度越大，采样点越远（自适应采样）
-            dist_move += self.dist_step * abs(self._model.get_v()) * self._dt   #从当前点前看了多少米
-            ind_move = int(round(dist_move / self._d_dist))                     #从当前点前看了多少米，轨迹采样间隔（ds=0.5m）
-            index = min(ind + ind_move, length - 1)  # 防止索引超出轨迹末尾
-            
-            # 提取参考状态
-            z_ref[0, i] = ref_path.cx[index]
-            z_ref[1, i] = ref_path.cy[index]
-            z_ref[2, i] = sp[index]
-            z_ref[3, i] = ref_path.cyaw[index]
+    def _unwrap_angle(self, angle, anchor=None):
+        angle = float(angle)
+        if anchor is None:
+            if self._last_unwrapped_yaw is None:
+                self._last_unwrapped_yaw = angle
+                return angle
+            anchor = float(self._last_unwrapped_yaw)
+            unwrapped = anchor + self._normalize_angle(angle - anchor)
+            self._last_unwrapped_yaw = unwrapped
+            return unwrapped
+        anchor = float(anchor)
+        return anchor + self._normalize_angle(angle - anchor)
 
-        return z_ref, ind
-    
-    def rotate(self, x, y, theta, ratio=1.75):
-        """
-        坐标旋转（绕原点旋转theta角度）
-        
-        用于计算车辆相对路径点的横向距离
-        
-        参数：
-            x, y: 原始坐标
-            theta: 旋转角度（弧度）
-            ratio: 缩放比例
-        
-        返回：
-            旋转后的坐标 [x', y']
-        """
-        return np.array([
-            (x * np.cos(theta) - y * np.sin(theta)) * ratio,
-            (x * np.sin(theta) + y * np.cos(theta)) * ratio
-        ])
-    
-    def lat_dis_wp_ev(self, wp, ev):
-        """
-        计算路径点与车辆之间的横向距离
-        
-        用于车道保持等功能的误差计算
-        
-        参数：
-            wp: 路径点Waypoint
-            ev: 车辆Actor
-        
-        返回：
-            横向距离（米）
-        """
-        # 提取位置
-        wp_loc = np.array([wp.transform.location.x, wp.transform.location.y])
-        ev_loc = np.array([ev.get_location().x, ev.get_location().y])
-        
-        # 旋转到路径点局部坐标系
-        wp_yaw = wp.transform.rotation.yaw
-        wp_loc = self.rotate(wp_loc[0], wp_loc[1], np.deg2rad(wp_yaw))
-        ev_loc = self.rotate(ev_loc[0], ev_loc[1], np.deg2rad(wp_yaw))
-        
-        # 返回y方向的距离（横向）
-        return np.abs(wp_loc[1] - ev_loc[1])
-    
-    def run_step(self, lv=None):
-        """
-        执行一步控制（核心方法，每个控制周期调用一次）
-        
-        流程：
-            1. 获取当前车辆状态
-            2. 更新路径点队列（移除已通过的）
-            3. 插值生成平滑参考路径
-            4. 计算T步参考轨迹
-            5. 调用MPC求解最优控制
-            6. 绘制预测轨迹（可视化）
-            7. 返回控制指令
-        
-        返回：
-            (a_opt, delta_opt, next_state): 加速度、转
-            向角、下一状态
-        """
-        # 累计仿真时间，dt=0.05s
-        self._simu_time += self._dt
+    def _lane_change_allows(self, marking, direction):
+        if marking is None:
+            return False
+        if direction == "left":
+            return bool(marking.lane_change & carla.LaneChange.Left)
+        return bool(marking.lane_change & carla.LaneChange.Right)
 
+    def _same_direction_driving_lane(self, source_wp, target_wp):
+        if target_wp is None or target_wp.lane_type != carla.LaneType.Driving:
+            return False
+        source_yaw = math.radians(source_wp.transform.rotation.yaw)
+        target_yaw = math.radians(target_wp.transform.rotation.yaw)
+        return abs(self._normalize_angle(target_yaw - source_yaw)) < math.pi / 2.0
 
-        # 日志功能
+    def _adjacent_lane_lateral_offset(self, waypoint, adjacent_waypoint):
+        yaw = math.radians(waypoint.transform.rotation.yaw)
+        left_axis = (-math.sin(yaw), math.cos(yaw))
+        source_loc = waypoint.transform.location
+        target_loc = adjacent_waypoint.transform.location
+        dx = target_loc.x - source_loc.x
+        dy = target_loc.y - source_loc.y
+        return dx * left_axis[0] + dy * left_axis[1]
 
+    def _extend_lane_bound(
+        self,
+        waypoint,
+        adjacent_waypoint,
+        current_lane_width,
+        ego_half_width,
+        margin,
+        left_bound,
+        right_bound,
+    ):
+        lateral_offset = self._adjacent_lane_lateral_offset(waypoint, adjacent_waypoint)
+        adjacent_width = max(
+            float(getattr(adjacent_waypoint, "lane_width", current_lane_width)),
+            1e-3,
+        )
+        extended_bound = max(
+            0.0,
+            abs(lateral_offset) + 0.5 * adjacent_width - ego_half_width - margin,
+        )
+        if lateral_offset > 0.0:
+            left_bound = max(left_bound, extended_bound)
+        elif lateral_offset < 0.0:
+            right_bound = max(right_bound, extended_bound)
+        return left_bound, right_bound
 
+    def _reference_lane_bounds(self, waypoint):
+        if waypoint is None:
+            return np.array([self._lane_bound_inactive, self._lane_bound_inactive], dtype=float)
 
-        import os
+        lane_width = max(float(getattr(waypoint, "lane_width", 3.5)), 1e-3)
+        ego_half_width = max(float(getattr(self._model, "ego_footprint_radius", 1.0)), 0.0)
+        margin = max(float(getattr(self._model, "lane_boundary_margin", 0.2)), 0.0)
+        base_bound = max(0.0, 0.5 * lane_width - ego_half_width - margin)
 
-        log_dir = r"C:\Users\Administrator\Desktop\carla_MPC-main2\carla_MPC-main2\debug_logs"
+        left_bound = base_bound
+        right_bound = base_bound
 
-        os.makedirs(log_dir, exist_ok=True)
+        left_lane = waypoint.get_left_lane() if hasattr(waypoint, "get_left_lane") else None
+        if (
+            self._lane_change_allows(getattr(waypoint, "left_lane_marking", None), "left")
+            and self._same_direction_driving_lane(waypoint, left_lane)
+        ):
+            left_bound, right_bound = self._extend_lane_bound(
+                waypoint,
+                left_lane,
+                lane_width,
+                ego_half_width,
+                margin,
+                left_bound,
+                right_bound,
+            )
 
-        log_file = os.path.join(log_dir, "run_debug.log")
+        right_lane = waypoint.get_right_lane() if hasattr(waypoint, "get_right_lane") else None
+        if (
+            self._lane_change_allows(getattr(waypoint, "right_lane_marking", None), "right")
+            and self._same_direction_driving_lane(waypoint, right_lane)
+        ):
+            left_bound, right_bound = self._extend_lane_bound(
+                waypoint,
+                right_lane,
+                lane_width,
+                ego_half_width,
+                margin,
+                left_bound,
+                right_bound,
+            )
 
-        def log(msg):
+        return np.array([left_bound, right_bound], dtype=float)
 
-            with open(log_file, "a", encoding="utf-8") as f:
+    @staticmethod
+    def _route_xy(route_item):
+        waypoint = route_item[0] if isinstance(route_item, (tuple, list)) else route_item
+        loc = waypoint.transform.location
+        return np.array([loc.x, loc.y], dtype=float)
 
-                f.write(msg + "\n")
-        
-        # -------------------------------------------
-        # 1. 获取当前车辆状态，
-        # state: [x, y, yaw, vx, vy, omega]，return [self.x, self.y, self.yaw, self.vx, self.vy, self.omega], self.z
-        # -------------------------------------------
-        state, height = self._model.get_state_carla()  # 从CARLA获取状态
-        # 坐标转换：CARLA坐标系（左手） -> 右手坐标系，yaw取弧度， vy, omega取相反方向
-        current_state = np.array(ca_u.carla_vector_to_rh_vector(
-            state[0:2], state[2], state[3:]
-        ))
-        
-        # -------------------------------------------
-        # 2. 动态计算最小跟车距离
-        # -------------------------------------------
-        veh_location = self._vehicle.get_location()         #当前车的坐标
-        vehicle_speed = self._model.get_v()                 #当前车速
-        # 速度越大，最小跟车距离越大（安全考虑）
-        self._min_distance = self._base_min_distance + 0.5 * vehicle_speed
+    def _build_route_cache(self, route):
+        points = []
+        entry_s = []
+        raw_lane_bounds = []
+        current_s = 0.0
+        is_manual_route = True
 
+        for item in route:
+            waypoint = item[0] if isinstance(item, (tuple, list)) else item
+            is_manual_route = is_manual_route and bool(getattr(waypoint, "is_manual_route", False))
+            point = self._route_xy(item)
+            if len(points) == 0 or np.linalg.norm(point - points[-1]) > 1e-3:
+                if points:
+                    current_s += float(np.linalg.norm(point - points[-1]))
+                points.append(point)
+                raw_lane_bounds.append(self._reference_lane_bounds(waypoint))
+            entry_s.append(current_s)
 
-        # -------------------------------------------
-        # 3. 获取参考路径点,_waypoints_queue先进先出
-        # -------------------------------------------
-        if len(self._waypoints_queue) == 0:
-            raise Exception("No waypoints to follow")
+        if len(points) < 2:
+            return None
+
+        raw_points = np.array(points, dtype=float)
+        raw_lane_bounds = np.asarray(raw_lane_bounds, dtype=float)
+        raw_segment_lengths = np.hypot(np.diff(raw_points[:, 0]), np.diff(raw_points[:, 1]))
+        raw_arc_lengths = np.concatenate(([0.0], np.cumsum(raw_segment_lengths)))
+
+        if is_manual_route or len(raw_points) < 4:
+            source_s, path_points, segment_lengths, arc_lengths = self._resample_polyline(
+                raw_points,
+                raw_arc_lengths,
+            )
         else:
-            carla_wp, _ = np.array(self._waypoints_queue).T   #这行代码就是从队列里把所有路点对象"倒出来"，方便后续逐个处理。【】
-            waypoints = []
-            v = math.sqrt(current_state[3]**2 + current_state[4]**2)  # 合成速度
-            waypoints.append([current_state[0], current_state[1], v, current_state[2]])#x，y，v，yaw
-            cnt = 0
+            source_s, path_points, segment_lengths, arc_lengths = self._smooth_polyline(
+                raw_points,
+                raw_arc_lengths,
+            )
 
+        lane_bounds = np.column_stack(
+            (
+                np.interp(source_s, raw_arc_lengths, raw_lane_bounds[:, 0]),
+                np.interp(source_s, raw_arc_lengths, raw_lane_bounds[:, 1]),
+            )
+        )
 
-            # -------------------------------------------
-            # 简化路径点（避免插值NaN）
-            # 只保留前30个点，减少计算量
-            # 同时去除距离过近的重复点
-            # -------------------------------------------
-            last_state = None
-            for wp in carla_wp:
-                if cnt > 30:
-                    break
-                cnt += 1
-                t = wp.transform
-                #参考轨迹（x，y，yaw）， last_state = None，不考虑v=0，omega=0
-                ref_state = ca_u.carla_vector_to_rh_vector(
-                    [t.location.x, t.location.y], t.rotation.yaw
+        entry_s = np.interp(np.array(entry_s, dtype=float), source_s, arc_lengths)
+        speed_profile = self._reference_speed_profile(
+            path_points,
+            arc_lengths,
+            segment_lengths,
+            0.0,
+            end_s=float(arc_lengths[-1]),
+        )
+
+        return {
+            "path_points": path_points,
+            "segment_lengths": segment_lengths,
+            "arc_lengths": arc_lengths,
+            "entry_s": entry_s,
+            "speed_profile": speed_profile,
+            "lane_bounds": lane_bounds,
+        }
+
+    def _resample_polyline(self, points, arc_lengths):
+        total_s = float(arc_lengths[-1])
+        ds = max(float(self._smooth_path_ds), 0.05)
+        source_s = np.arange(0.0, total_s, ds, dtype=float)
+        if len(source_s) == 0 or source_s[-1] < total_s:
+            source_s = np.append(source_s, total_s)
+        sampled = np.column_stack(
+            (
+                np.interp(source_s, arc_lengths, points[:, 0]),
+                np.interp(source_s, arc_lengths, points[:, 1]),
+            )
+        )
+        seg = np.hypot(np.diff(sampled[:, 0]), np.diff(sampled[:, 1]))
+        sampled_s = np.concatenate(([0.0], np.cumsum(seg)))
+        return source_s, sampled, seg, sampled_s
+
+    def _smooth_polyline(self, points, arc_lengths):
+        total_s = float(arc_lengths[-1])
+        ds = max(float(self._smooth_path_ds), 0.05)
+        source_s = np.arange(0.0, total_s, ds, dtype=float)
+        if len(source_s) == 0 or source_s[-1] < total_s:
+            source_s = np.append(source_s, total_s)
+        spline_x = CubicSpline(arc_lengths, points[:, 0], bc_type="natural")
+        spline_y = CubicSpline(arc_lengths, points[:, 1], bc_type="natural")
+        sampled = np.column_stack((spline_x(source_s), spline_y(source_s)))
+        keep = np.ones(len(sampled), dtype=bool)
+        keep[1:] = np.linalg.norm(np.diff(sampled, axis=0), axis=1) > 1e-5
+        source_s = source_s[keep]
+        sampled = sampled[keep]
+        seg = np.hypot(np.diff(sampled[:, 0]), np.diff(sampled[:, 1]))
+        sampled_s = np.concatenate(([0.0], np.cumsum(seg)))
+        return source_s, sampled, seg, sampled_s
+
+    def _project_to_path(self, point, path_points, arc_lengths, segment_lengths, min_s=None, max_s=None, heading_yaw=None):
+        point = np.asarray(point, dtype=float)
+        segment_count = len(segment_lengths)
+        if segment_count <= 0:
+            return 0.0, path_points[0], 0.0, 0.0
+
+        lower_s = 0.0 if min_s is None else float(min_s)
+        upper_s = float(arc_lengths[-1]) if max_s is None else float(max_s)
+        if upper_s < lower_s:
+            lower_s, upper_s = upper_s, lower_s
+        start_idx = int(np.searchsorted(arc_lengths[1:], lower_s, side="left"))
+        end_idx = int(np.searchsorted(arc_lengths[:-1], upper_s, side="right"))
+        start_idx = min(max(start_idx, 0), segment_count - 1)
+        end_idx = min(max(end_idx, start_idx + 1), segment_count)
+
+        starts = path_points[start_idx:end_idx]
+        ends = path_points[start_idx + 1 : end_idx + 1]
+        local_lengths = segment_lengths[start_idx:end_idx]
+        vectors = ends - starts
+        ratios = np.sum((point - starts) * vectors, axis=1) / np.maximum(local_lengths * local_lengths, 1e-9)
+        ratios = np.clip(ratios, 0.0, 1.0)
+        projections = starts + ratios[:, None] * vectors
+        distances_sq = np.sum((point - projections) * (point - projections), axis=1)
+        candidate_s = arc_lengths[start_idx:end_idx] + ratios * local_lengths
+
+        scores = distances_sq.copy()
+        if heading_yaw is not None:
+            segment_yaws = np.arctan2(vectors[:, 1], vectors[:, 0])
+            yaw_errors = np.arctan2(np.sin(segment_yaws - heading_yaw), np.cos(segment_yaws - heading_yaw))
+            scores += 4.0 * yaw_errors * yaw_errors
+
+        local_idx = int(np.argmin(scores))
+        yaw = float(np.arctan2(vectors[local_idx, 1], vectors[local_idx, 0]))
+        lat_axis = np.array([-math.sin(yaw), math.cos(yaw)], dtype=float)
+        lateral = float((point - projections[local_idx]) @ lat_axis)
+        return float(candidate_s[local_idx]), projections[local_idx], yaw, lateral
+
+    def _sample_path_position(self, path_points, arc_lengths, segment_lengths, path_s):
+        path_s = float(np.clip(path_s, 0.0, arc_lengths[-1]))
+        seg_idx = int(np.searchsorted(arc_lengths, path_s, side="right") - 1)
+        seg_idx = min(max(seg_idx, 0), len(segment_lengths) - 1)
+        ratio = (path_s - arc_lengths[seg_idx]) / max(float(segment_lengths[seg_idx]), 1e-6)
+        return path_points[seg_idx] + float(np.clip(ratio, 0.0, 1.0)) * (path_points[seg_idx + 1] - path_points[seg_idx])
+
+    def _sample_path(self, path_points, arc_lengths, segment_lengths, path_s):
+        path_s = float(np.clip(path_s, 0.0, arc_lengths[-1]))
+        pos = self._sample_path_position(path_points, arc_lengths, segment_lengths, path_s)
+        s0 = max(path_s - self._reference_yaw_window, 0.0)
+        s1 = min(path_s + self._reference_yaw_window, arc_lengths[-1])
+        p0 = self._sample_path_position(path_points, arc_lengths, segment_lengths, s0)
+        p1 = self._sample_path_position(path_points, arc_lengths, segment_lengths, s1)
+        delta = p1 - p0
+        if np.linalg.norm(delta) < 1e-6:
+            s1 = min(path_s + self._reference_yaw_window, arc_lengths[-1])
+            p1 = self._sample_path_position(path_points, arc_lengths, segment_lengths, s1)
+            delta = p1 - pos
+        if np.linalg.norm(delta) < 1e-6:
+            seg_idx = int(np.searchsorted(arc_lengths, path_s, side="right") - 1)
+            seg_idx = min(max(seg_idx, 0), len(segment_lengths) - 1)
+            delta = path_points[seg_idx + 1] - path_points[seg_idx]
+        yaw = float(np.arctan2(delta[1], delta[0]))
+        return pos, yaw
+
+    def _path_curvature_at(self, path_points, arc_lengths, segment_lengths, path_s):
+        window = max(float(self._curvature_sample_window), 0.5)
+        p0 = self._sample_path_position(path_points, arc_lengths, segment_lengths, max(path_s - window, 0.0))
+        p1 = self._sample_path_position(path_points, arc_lengths, segment_lengths, path_s)
+        p2 = self._sample_path_position(path_points, arc_lengths, segment_lengths, min(path_s + window, arc_lengths[-1]))
+        a = float(np.linalg.norm(p1 - p0))
+        b = float(np.linalg.norm(p2 - p1))
+        c = float(np.linalg.norm(p2 - p0))
+        if min(a, b, c) < 1e-6:
+            return 0.0
+        area_twice = abs(float((p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])))
+        return 2.0 * area_twice / max(a * b * c, 1e-9)
+
+    def _curve_speed_limit_at(self, path_points, arc_lengths, segment_lengths, path_s):
+        target_speed = float(self._model.target_v)
+        curvature = self._path_curvature_at(path_points, arc_lengths, segment_lengths, path_s)
+        if curvature < 1e-4:
+            return target_speed
+        return float(np.clip(math.sqrt(self._max_reference_lateral_accel / curvature), self._min_curve_speed, target_speed))
+
+    def _reference_speed_profile(self, path_points, arc_lengths, segment_lengths, current_s, end_s=None):
+        target_speed = float(self._model.target_v)
+        if target_speed <= 0.0:
+            return np.array([current_s], dtype=float), np.array([target_speed], dtype=float)
+        end_s = float(arc_lengths[-1]) if end_s is None else min(float(end_s), float(arc_lengths[-1]))
+        ds = max(float(self._speed_profile_ds), 0.1)
+        grid_s = np.arange(float(current_s), end_s, ds, dtype=float)
+        if len(grid_s) == 0 or abs(grid_s[-1] - end_s) > 1e-6:
+            grid_s = np.append(grid_s, end_s)
+        grid_v = np.array([self._curve_speed_limit_at(path_points, arc_lengths, segment_lengths, s) for s in grid_s], dtype=float)
+        if len(grid_v) > 0:
+            grid_v[-1] = min(grid_v[-1], float(self._terminal_reference_speed))
+
+        max_decel = max(float(self._reference_comfort_decel), 1e-3)
+        for i in range(len(grid_s) - 2, -1, -1):
+            ds_i = max(float(grid_s[i + 1] - grid_s[i]), 1e-6)
+            grid_v[i] = min(grid_v[i], math.sqrt(grid_v[i + 1] * grid_v[i + 1] + 2.0 * max_decel * ds_i))
+        max_accel = max(float(self._reference_comfort_accel), 1e-3)
+        for i in range(len(grid_s) - 1):
+            ds_i = max(float(grid_s[i + 1] - grid_s[i]), 1e-6)
+            grid_v[i + 1] = min(grid_v[i + 1], math.sqrt(grid_v[i] * grid_v[i] + 2.0 * max_accel * ds_i))
+        return grid_s, grid_v
+
+    @staticmethod
+    def _speed_at_profile_s(speed_profile, path_s):
+        grid_s, grid_v = speed_profile
+        return float(np.interp(float(path_s), grid_s, grid_v))
+
+    def _advance_reference_s(self, current_s, speed_profile, total_length):
+        ref_speed = self._speed_at_profile_s(speed_profile, current_s)
+        return min(float(current_s) + max(ref_speed, 0.5) * self._dt, float(total_length))
+
+    def _update_route_progress(self, x, y, yaw, speed):
+        cache = self._route_cache
+        if cache is None:
+            return
+        total_s = float(cache["arc_lengths"][-1])
+        previous_s = float(np.clip(self._route_progress_s, 0.0, total_s))
+        search_back = max(4.0, self._base_min_distance + 0.2 * max(speed, 0.0))
+        search_forward = max(
+            self._projection_min_lookahead,
+            self._base_min_distance + self._projection_time_lookahead * max(speed, 0.0),
+            25.0,
+        )
+        projected_s, _, _, _ = self._project_to_path(
+            [x, y],
+            cache["path_points"],
+            cache["arc_lengths"],
+            cache["segment_lengths"],
+            min_s=max(previous_s - search_back, 0.0),
+            max_s=min(previous_s + search_forward, total_s),
+            heading_yaw=yaw,
+        )
+        self._route_progress_s = max(previous_s, float(projected_s))
+        new_start_index = int(np.searchsorted(cache["entry_s"], self._route_progress_s, side="right") - 1)
+        new_start_index = min(max(new_start_index, 0), len(cache["entry_s"]) - 1)
+        remove_count = max(new_start_index - self._route_start_index, 0)
+        if self._preserve_terminal_waypoint and len(self._waypoints_queue) > 0:
+            remove_count = min(remove_count, max(len(self._waypoints_queue) - 1, 0))
+        for _ in range(min(remove_count, len(self._waypoints_queue))):
+            self._waypoints_queue.popleft()
+        self._route_start_index = new_start_index
+
+    def _window_geometry_from_route_cache(self):
+        cache = self._route_cache
+        if cache is None:
+            return None
+
+        total_s = float(cache["arc_lengths"][-1])
+        if total_s <= 1e-6:
+            return None
+
+        start_s = float(np.clip(self._route_progress_s, 0.0, total_s))
+        preview_distance = max(
+            self._projection_min_lookahead,
+            float(self._model.target_v) * self._dt * (self._model.horizon + 80),
+            60.0,
+        )
+        end_s = min(start_s + preview_distance, total_s)
+        if end_s <= start_s + 1e-6:
+            return None
+
+        smooth_arc = cache["arc_lengths"]
+        start_index = int(np.searchsorted(smooth_arc, start_s, side="right"))
+        end_index = int(np.searchsorted(smooth_arc, end_s, side="left"))
+        window_s = np.concatenate(([start_s], smooth_arc[start_index:end_index], [end_s]))
+
+        path_points = np.empty((len(window_s), 2), dtype=float)
+        cache_points = cache["path_points"]
+        path_points[:, 0] = np.interp(window_s, smooth_arc, cache_points[:, 0])
+        path_points[:, 1] = np.interp(window_s, smooth_arc, cache_points[:, 1])
+        lane_bounds = np.empty((len(window_s), 2), dtype=float)
+        cache_lane_bounds = cache["lane_bounds"]
+        lane_bounds[:, 0] = np.interp(window_s, smooth_arc, cache_lane_bounds[:, 0])
+        lane_bounds[:, 1] = np.interp(window_s, smooth_arc, cache_lane_bounds[:, 1])
+
+        if len(path_points) > 1:
+            keep = np.ones(len(path_points), dtype=bool)
+            deltas = np.diff(path_points, axis=0)
+            keep[1:] = np.einsum("ij,ij->i", deltas, deltas) > 1e-8
+            path_points = path_points[keep]
+            lane_bounds = lane_bounds[keep]
+
+        if len(path_points) < 2:
+            return None
+
+        segment_lengths = np.hypot(
+            np.diff(path_points[:, 0]),
+            np.diff(path_points[:, 1]),
+        )
+        arc_lengths = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+        origin_s = start_s
+        return path_points, segment_lengths, arc_lengths, origin_s, lane_bounds
+
+    def _sample_path_bounds(self, lane_bounds, arc_lengths, segment_lengths, path_s):
+        path_s = float(np.clip(path_s, 0.0, arc_lengths[-1]))
+        seg_idx = int(np.searchsorted(arc_lengths, path_s, side="right") - 1)
+        seg_idx = min(max(seg_idx, 0), len(segment_lengths) - 1)
+        seg_len = max(float(segment_lengths[seg_idx]), 1e-6)
+        ratio = float(np.clip((path_s - arc_lengths[seg_idx]) / seg_len, 0.0, 1.0))
+        return (1.0 - ratio) * lane_bounds[seg_idx] + ratio * lane_bounds[seg_idx + 1]
+
+    def _obstacle_speed_limit_at(self, path_s, obstacles, cache):
+        if obstacles is None or len(obstacles) == 0:
+            return float(self._model.target_v)
+
+        speed_limit = float(self._model.target_v)
+        static_speed_threshold = float(self._model.obstacle_static_speed_threshold)
+        for obstacle in np.asarray(obstacles, dtype=float):
+            obstacle = np.asarray(obstacle, dtype=float).flatten()
+            if len(obstacle) < 8:
+                continue
+            obs_speed = float(obstacle[5]) if len(obstacle) > 5 else 0.0
+            is_vehicle = float(obstacle[6]) if len(obstacle) > 6 else 1.0
+            pass_lateral = float(obstacle[7]) if len(obstacle) > 7 else 0.0
+            if is_vehicle < 0.5:
+                continue
+
+            obs_s, _, _, obs_lateral = self._project_to_path(
+                obstacle[:2],
+                cache["path_points"],
+                cache["arc_lengths"],
+                cache["segment_lengths"],
+            )
+            half_length = max(float(obstacle[4]) if len(obstacle) > 4 else 2.2, 2.2)
+            route_pass_lateral = float(obs_lateral) + pass_lateral
+            if obs_speed > static_speed_threshold:
+                if abs(route_pass_lateral) <= 1e-6:
+                    route_pass_lateral = self._infer_dynamic_route_pass_lateral(
+                        cache,
+                        float(obs_s),
+                        lookahead_distance=self._dynamic_overtake_start_distance + half_length,
+                    )
+                # Only treat vehicles already occupying the reference lane as
+                # primary follow/overtake targets. Vehicles on the adjacent lane
+                # should block the target gap, but they should not directly cap
+                # the ego reference speed after the ego has started moving out.
+                if abs(float(obs_lateral)) > self._dynamic_overtake_same_lane_lateral:
+                    continue
+                obs_radius = max(
+                    float(obstacle[3]) if len(obstacle) > 3 else self._model.obstacle_min_radius,
+                    float(self._model.obstacle_min_radius),
                 )
-                if last_state is not None:
-                    # 距离太近的路径点会导致三次样条插值出现NaN
-                    if np.sqrt(ref_state[0]**2 + ref_state[1]**2) - last_state < 0.005:
+                current_clearance = (
+                    obs_s
+                    - path_s
+                    - half_length
+                    - float(self._model.ego_footprint_half_length)
+                )
+                if (
+                    current_clearance < -self._dynamic_vehicle_rear_release_clearance
+                    or current_clearance > self._dynamic_vehicle_yield_distance
+                ):
+                    continue
+
+                lane_gap_blocked, lane_front_gap = self._dynamic_target_lane_gap_blocked(
+                    obstacles,
+                    cache,
+                    path_s,
+                    float(obs_s),
+                    half_length,
+                    route_pass_lateral,
+                )
+
+                ego_lateral_now = float(cache.get("ego_lateral_now", 0.0))
+                reference_lateral = float(cache.get("reference_lateral", ego_lateral_now))
+                current_lateral_gap = max(
+                    abs(ego_lateral_now - float(obs_lateral)),
+                    abs(reference_lateral - float(obs_lateral)),
+                )
+                release_lateral = max(1.2, 0.42 * abs(route_pass_lateral)) if abs(route_pass_lateral) > 1e-6 else 1.2
+                target_lateral_gap = max(abs(pass_lateral), release_lateral, 1e-3)
+                lateral_progress = float(
+                    np.clip(current_lateral_gap / target_lateral_gap, 0.0, 1.0)
+                )
+                if current_lateral_gap >= release_lateral and not lane_gap_blocked:
+                    continue
+
+                dynamic_cluster = {
+                    "rear_s": float(obs_s) - half_length,
+                    "front_s": float(obs_s) + half_length,
+                    "bypass_start_distance": self._dynamic_overtake_start_distance,
+                    "bypass_full_distance": self._dynamic_overtake_full_distance,
+                    "return_front_clearance_lengths": self._dynamic_overtake_return_front_clearance_lengths,
+                    "return_distance": self._dynamic_overtake_return_distance,
+                }
+                pass_profile = self._route_bypass_profile(path_s, dynamic_cluster)
+                legal_bounds_now = self._sample_path_bounds(
+                    cache["lane_bounds"],
+                    cache["arc_lengths"],
+                    cache["segment_lengths"],
+                    path_s,
+                )
+                if (
+                    not lane_gap_blocked
+                    and
+                    pass_profile >= 0.55
+                    and self._lane_bound_supports_offset(
+                        route_pass_lateral,
+                        legal_bounds_now,
+                        required_ratio=0.55,
+                    )
+                ):
+                    continue
+
+                support_window_end = min(
+                    obs_s + half_length + self._dynamic_overtake_start_distance,
+                    float(cache["arc_lengths"][-1]),
+                )
+                side_support_ahead = self._lane_bound_supports_offset_ahead(
+                    route_pass_lateral,
+                    cache,
+                    path_s,
+                    support_window_end,
+                )
+                clearance_margin = max(0.0, float(self._dynamic_vehicle_follow_clearance_margin))
+                clearance_release_gate = max(
+                    self._dynamic_follow_gate_clearance,
+                    clearance_margin + 2.0,
+                )
+                if (
+                    not lane_gap_blocked
+                    and side_support_ahead
+                    and current_clearance > clearance_release_gate
+                ):
+                    if self._debug_log_enabled and current_clearance < 18.0:
+                        self._append_debug_log(
+                            "[DYN-SPEED] release_far "
+                            f"path_s={path_s:.2f} obs_s={float(obs_s):.2f} "
+                            f"clear={current_clearance:.2f} obs_v={obs_speed:.2f} "
+                            f"pass_lat={route_pass_lateral:.2f} ref_lat={reference_lateral:.2f} "
+                            f"gap={current_lateral_gap:.2f} lat_prog={lateral_progress:.2f}"
+                        )
+                    continue
+                if not lane_gap_blocked and side_support_ahead:
+                    if lateral_progress >= 0.24:
+                        if self._debug_log_enabled and current_clearance < 18.0:
+                            self._append_debug_log(
+                                "[DYN-SPEED] release_side "
+                                f"path_s={path_s:.2f} obs_s={float(obs_s):.2f} "
+                                f"clear={current_clearance:.2f} obs_v={obs_speed:.2f} "
+                                f"pass_lat={route_pass_lateral:.2f} ref_lat={reference_lateral:.2f} "
+                                f"gap={current_lateral_gap:.2f} lat_prog={lateral_progress:.2f}"
+                            )
                         continue
-                waypoints.append([
-                    ref_state[0], ref_state[1],
-                    self._model.target_v, ref_state[2]
-                ])
-                last_state = np.sqrt(ref_state[0]**2 + ref_state[1]**2)
 
-            #把从carla_wp里得到的前30个路径点信息进行判断，距离过近的点取其一，得到新的路点列表，cnt行4列
-            #waypoints=[[current_state[0], current_state[1], v, current_state[2]]，
-            #   cnt=1   [ref_state[0], ref_state[1],self._model.target_v, ref_state[2]]，
-            #   cnt=2   [ref_state[0], ref_state[1],self._model.target_v, ref_state[2]]
-            waypoints = np.array(waypoints).T
-            #T后：(第一列是当前状态，后面是参考点的状态)
-            #├── 0: [x_0, x_1, x_2, ..., x_(N - 1)]     ← x
-            #坐标
-            #├── 1: [y_0, y_1, y_2, ..., y_(N - 1)]     ← y
-            #坐标
-            #├── 2: [v_0, v_1, v_2, ..., v_(N - 1)]      ← 速度（第一个是当前速度，后面是target_v）
-            #└── 3: [yaw_0, yaw_1, yaw_2, ..., yaw_(N - 1)] ← yaw弧度角
+                release_progress = 0.0
+                if not lane_gap_blocked:
+                    if pass_profile > 0.10:
+                        release_progress = max(
+                            release_progress,
+                            float(np.clip((pass_profile - 0.10) / 0.50, 0.0, 1.0)),
+                        )
+                    if lateral_progress > 0.12:
+                        release_progress = max(
+                            release_progress,
+                            float(np.clip((lateral_progress - 0.12) / 0.45, 0.0, 1.0)),
+                        )
 
+                follow_distance = (
+                    self._dynamic_vehicle_follow_buffer
+                    + self._dynamic_vehicle_follow_time_headway * max(obs_speed, 0.0)
+                )
+                safe_follow_distance = follow_distance + clearance_margin
+                if current_clearance <= safe_follow_distance:
+                    deficit_ratio = float(
+                        np.clip(
+                            (safe_follow_distance - current_clearance)
+                            / max(safe_follow_distance, 1e-3),
+                            0.0,
+                            1.0,
+                        )
+                    )
+                    slowdown = min(
+                        float(self._dynamic_vehicle_follow_max_slowdown),
+                        float(self._dynamic_vehicle_follow_speed_deficit_gain) * deficit_ratio,
+                    )
+                    follow_speed = max(
+                        self._dynamic_vehicle_crawl_speed,
+                        obs_speed - slowdown,
+                    )
+                    if release_progress > 0.0:
+                        released_speed = follow_speed + release_progress * max(
+                            float(self._model.target_v) - follow_speed,
+                            0.0,
+                        )
+                        if self._debug_log_enabled and current_clearance < 18.0:
+                            self._append_debug_log(
+                                "[DYN-SPEED] follow_release "
+                                f"path_s={path_s:.2f} obs_s={float(obs_s):.2f} "
+                                f"clear={current_clearance:.2f} follow_d={follow_distance:.2f} "
+                                f"safe_d={safe_follow_distance:.2f} "
+                                f"obs_v={obs_speed:.2f} pass_prof={pass_profile:.2f} "
+                                f"slowdown={slowdown:.2f} rel_prog={release_progress:.2f} "
+                                f"limit={released_speed:.2f}"
+                            )
+                        speed_limit = min(speed_limit, released_speed)
+                        continue
+                    if self._debug_log_enabled and current_clearance < 18.0:
+                        blocker_suffix = (
+                            f" lane_gap={lane_front_gap:.2f}"
+                            if lane_gap_blocked and np.isfinite(lane_front_gap)
+                            else ""
+                        )
+                        self._append_debug_log(
+                            "[DYN-SPEED] follow_hold "
+                            f"path_s={path_s:.2f} obs_s={float(obs_s):.2f} "
+                            f"clear={current_clearance:.2f} follow_d={follow_distance:.2f} "
+                            f"safe_d={safe_follow_distance:.2f} "
+                            f"obs_v={obs_speed:.2f} pass_prof={pass_profile:.2f} "
+                            f"slowdown={slowdown:.2f} lat_prog={lateral_progress:.2f} "
+                            f"limit={follow_speed:.2f}"
+                            f"{blocker_suffix}"
+                        )
+                    speed_limit = min(
+                        speed_limit,
+                        follow_speed,
+                    )
+                    continue
 
+                follow_cap_sq = (
+                    obs_speed * obs_speed
+                    + 2.0
+                    * self._dynamic_vehicle_reference_decel
+                    * max(current_clearance - safe_follow_distance, 0.0)
+                )
+                follow_cap = math.sqrt(max(follow_cap_sq, 0.0))
+                if not lane_gap_blocked:
+                    if pass_profile >= 0.55:
+                        follow_cap = max(
+                            follow_cap,
+                            obs_speed + 0.70 * max(float(self._model.target_v) - obs_speed, 0.0),
+                        )
+                    elif lateral_progress >= 0.22:
+                        follow_cap = max(
+                            follow_cap,
+                            obs_speed + 0.50 * max(float(self._model.target_v) - obs_speed, 0.0),
+                        )
+                if release_progress > 0.0:
+                    follow_cap = follow_cap + release_progress * max(
+                        float(self._model.target_v) - follow_cap,
+                        0.0,
+                    )
+                if self._debug_log_enabled and current_clearance < 18.0:
+                    blocker_suffix = (
+                        f" lane_gap={lane_front_gap:.2f}"
+                        if lane_gap_blocked and np.isfinite(lane_front_gap)
+                        else ""
+                    )
+                    self._append_debug_log(
+                        "[DYN-SPEED] cap "
+                        f"path_s={path_s:.2f} obs_s={float(obs_s):.2f} "
+                        f"clear={current_clearance:.2f} follow_d={follow_distance:.2f} "
+                        f"safe_d={safe_follow_distance:.2f} "
+                        f"obs_v={obs_speed:.2f} pass_prof={pass_profile:.2f} "
+                        f"lat_prog={lateral_progress:.2f} rel_prog={release_progress:.2f} "
+                        f"limit={max(obs_speed, follow_cap):.2f}{blocker_suffix}"
+                    )
+                speed_limit = min(speed_limit, max(obs_speed, follow_cap))
+                continue
 
-        # -------------------------------------------
-        # 4. 移除已通过的路径点
-        # -------------------------------------------
-        num_waypoint_removed = 0        # 移除路径点计数器
-        for waypoint, _ in self._waypoints_queue:
-            # 最后一个点要特殊处理（快到了才移除）
-            if len(self._waypoints_queue) - num_waypoint_removed == 1:     # 只剩最后一个点未被移除
-                min_distance = 1                                           #缩小移除距离
+            if abs(route_pass_lateral) <= 1e-6:
+                continue
+
+            entry_s = obs_s - half_length - self._obstacle_speed_entry_distance
+            exit_s = obs_s + half_length + self._obstacle_speed_exit_distance
+            if entry_s <= path_s <= exit_s:
+                speed_limit = min(speed_limit, self._obstacle_bypass_speed)
+        return speed_limit
+
+    @staticmethod
+    def _smoothstep_value(value):
+        value = float(np.clip(value, 0.0, 1.0))
+        return value * value * (3.0 - 2.0 * value)
+
+    @staticmethod
+    def _lane_bound_supports_offset(target_lateral, legal_bounds, required_ratio=0.75):
+        target_lateral = float(target_lateral)
+        if abs(target_lateral) <= 1e-6:
+            return True
+        left_bound = max(float(legal_bounds[0]), 0.0)
+        right_bound = max(float(legal_bounds[1]), 0.0)
+        needed = required_ratio * abs(target_lateral)
+        if target_lateral > 0.0:
+            return left_bound >= needed
+        return right_bound >= needed
+
+    def _lane_bound_supports_offset_ahead(
+        self,
+        target_lateral,
+        cache,
+        start_s,
+        end_s,
+        required_ratio=0.65,
+        min_support_count=2,
+        sample_count=7,
+    ):
+        if cache is None or abs(float(target_lateral)) <= 1e-6:
+            return False
+
+        total_s = float(cache["arc_lengths"][-1])
+        start_s = float(np.clip(start_s, 0.0, total_s))
+        end_s = float(np.clip(end_s, start_s, total_s))
+        if end_s <= start_s + 1e-6:
+            return False
+
+        support_count = 0
+        for sample_s in np.linspace(start_s, end_s, int(sample_count), dtype=float):
+            legal_bounds = self._sample_path_bounds(
+                cache["lane_bounds"],
+                cache["arc_lengths"],
+                cache["segment_lengths"],
+                float(sample_s),
+            )
+            if self._lane_bound_supports_offset(
+                target_lateral,
+                legal_bounds,
+                required_ratio=required_ratio,
+            ):
+                support_count += 1
+                if support_count >= int(min_support_count):
+                    return True
+        return False
+
+    def _infer_dynamic_route_pass_lateral(
+        self,
+        cache,
+        start_s,
+        lookahead_distance=None,
+        sample_count=9,
+        min_extra_lateral=1.6,
+    ):
+        if cache is None:
+            return 0.0
+
+        total_s = float(cache["arc_lengths"][-1])
+        start_s = float(np.clip(start_s, 0.0, total_s))
+        lookahead_distance = float(
+            self._dynamic_overtake_start_distance if lookahead_distance is None else lookahead_distance
+        )
+        end_s = float(np.clip(start_s + max(lookahead_distance, 2.0), start_s, total_s))
+        if end_s <= start_s + 1e-6:
+            return 0.0
+
+        best_lateral = 0.0
+        best_extra = 0.0
+        for sample_s in np.linspace(start_s, end_s, int(sample_count), dtype=float):
+            legal_bounds = self._sample_path_bounds(
+                cache["lane_bounds"],
+                cache["arc_lengths"],
+                cache["segment_lengths"],
+                float(sample_s),
+            )
+            left_bound = max(float(legal_bounds[0]), 0.0)
+            right_bound = max(float(legal_bounds[1]), 0.0)
+            base_bound = min(left_bound, right_bound)
+            extra_left = max(left_bound - base_bound, 0.0)
+            extra_right = max(right_bound - base_bound, 0.0)
+
+            if extra_left >= float(min_extra_lateral) and extra_left > best_extra:
+                best_extra = extra_left
+                best_lateral = extra_left
+            if extra_right >= float(min_extra_lateral) and extra_right > best_extra:
+                best_extra = extra_right
+                best_lateral = -extra_right
+
+        return float(best_lateral)
+
+    def _dynamic_target_lane_gap_blocked(
+        self,
+        obstacles,
+        cache,
+        current_s,
+        candidate_obs_s,
+        candidate_half_length,
+        route_pass_lateral,
+    ):
+        if obstacles is None or len(obstacles) == 0 or cache is None or abs(route_pass_lateral) <= 1e-6:
+            return False, float("inf")
+
+        obstacle_rows = np.asarray(obstacles, dtype=float)
+        if obstacle_rows.ndim == 1:
+            obstacle_rows = obstacle_rows.reshape(1, -1)
+
+        static_speed_threshold = float(self._model.obstacle_static_speed_threshold)
+        candidate_rear_s = float(candidate_obs_s) - float(candidate_half_length)
+        candidate_front_s = float(candidate_obs_s) + float(candidate_half_length)
+        ego_merge_start = max(
+            float(current_s) + float(self._model.ego_footprint_half_length),
+            candidate_rear_s - float(self._dynamic_overtake_start_distance),
+        )
+        corridor_start = ego_merge_start - float(self._dynamic_lane_change_rear_gap)
+        corridor_end = candidate_front_s + float(self._dynamic_lane_change_front_gap)
+        target_lane_center = float(route_pass_lateral)
+        best_front_gap = float("inf")
+        blocked = False
+
+        for row in obstacle_rows:
+            row = np.asarray(row, dtype=float).flatten()
+            if len(row) < 8:
+                continue
+
+            obs_speed = float(row[5])
+            is_vehicle = float(row[6])
+            if is_vehicle < 0.5 or obs_speed <= static_speed_threshold:
+                continue
+
+            other_s, _, _, other_lateral = self._project_to_path(
+                row[:2],
+                cache["path_points"],
+                cache["arc_lengths"],
+                cache["segment_lengths"],
+            )
+            other_half_length = max(
+                float(row[4]) if len(row) > 4 else float(self._model.obstacle_longitudinal_min_half),
+                float(self._model.obstacle_longitudinal_min_half),
+            )
+            if (
+                abs(float(other_s) - float(candidate_obs_s)) < 1.0
+                and abs(float(other_lateral)) <= self._dynamic_overtake_same_lane_lateral
+            ):
+                continue
+
+            if abs(float(other_lateral) - target_lane_center) > self._dynamic_lane_change_target_lane_tolerance:
+                continue
+
+            other_rear_s = float(other_s) - other_half_length
+            other_front_s = float(other_s) + other_half_length
+
+            if other_rear_s >= candidate_front_s:
+                best_front_gap = min(best_front_gap, other_rear_s - candidate_front_s)
+
+            if other_rear_s <= corridor_end and other_front_s >= corridor_start:
+                blocked = True
+
+        return blocked, best_front_gap
+
+    def _build_route_bypass_clusters(self, obstacles, cache, current_s=None):
+        if obstacles is None or len(obstacles) == 0:
+            return []
+
+        obstacle_rows = np.asarray(obstacles, dtype=float)
+        if obstacle_rows.ndim == 1:
+            obstacle_rows = obstacle_rows.reshape(1, -1)
+
+        candidates = []
+        static_speed_threshold = float(self._model.obstacle_static_speed_threshold)
+        dynamic_overtake_max_speed = max(
+            static_speed_threshold,
+            float(self._model.target_v) - self._dynamic_overtake_min_speed_delta,
+        )
+        for row in obstacle_rows:
+            row = np.asarray(row, dtype=float).flatten()
+            if len(row) < 8:
+                continue
+            obs_speed = float(row[5])
+            is_vehicle = float(row[6])
+            pass_lateral = float(row[7])
+            if is_vehicle < 0.5 or abs(pass_lateral) <= 1e-6:
+                continue
+
+            obs_s, _, _, obs_lateral = self._project_to_path(
+                row[:2],
+                cache["path_points"],
+                cache["arc_lengths"],
+                cache["segment_lengths"],
+            )
+            route_pass_lateral = float(obs_lateral) + pass_lateral
+            half_length = max(
+                float(row[4]) if len(row) > 4 else float(self._model.obstacle_longitudinal_min_half),
+                float(self._model.obstacle_longitudinal_min_half),
+            )
+            if obs_speed > static_speed_threshold:
+                if current_s is not None:
+                    current_clearance = (
+                        float(obs_s)
+                        - float(current_s)
+                        - half_length
+                        - float(self._model.ego_footprint_half_length)
+                    )
+                    if (
+                        current_clearance < -self._dynamic_vehicle_rear_release_clearance
+                        or current_clearance > self._dynamic_vehicle_yield_distance + 15.0
+                    ):
+                        continue
+                if abs(route_pass_lateral) <= 1e-6:
+                    route_pass_lateral = self._infer_dynamic_route_pass_lateral(
+                        cache,
+                        float(obs_s),
+                        lookahead_distance=self._dynamic_overtake_start_distance + half_length,
+                    )
+                if abs(obs_lateral) > self._dynamic_overtake_same_lane_lateral:
+                    continue
+                if obs_speed >= dynamic_overtake_max_speed:
+                    continue
+                if abs(route_pass_lateral) <= 1e-6:
+                    continue
+                lane_gap_blocked, _ = self._dynamic_target_lane_gap_blocked(
+                    obstacles,
+                    cache,
+                    float(current_s) if current_s is not None else float(obs_s),
+                    float(obs_s),
+                    half_length,
+                    route_pass_lateral,
+                )
+                if lane_gap_blocked:
+                    continue
+                candidate = {
+                    "rear_s": float(obs_s) - half_length,
+                    "front_s": float(obs_s) + half_length,
+                    "pass_lateral": route_pass_lateral,
+                    "bypass_start_distance": self._dynamic_overtake_start_distance,
+                    "bypass_full_distance": self._dynamic_overtake_full_distance,
+                    "return_front_clearance_lengths": self._dynamic_overtake_return_front_clearance_lengths,
+                    "return_distance": self._dynamic_overtake_return_distance,
+                    "reference_lateral_limit": max(abs(route_pass_lateral), self._obstacle_reference_lateral_limit),
+                }
             else:
-                min_distance = self._min_distance
-            
-            # 如果车辆已经到达该路径点，移除它
-            if veh_location.distance(waypoint.transform.location) < min_distance:
-                num_waypoint_removed += 1
-            else:
+                if abs(route_pass_lateral) <= 1e-6:
+                    continue
+                candidate = {
+                    "rear_s": float(obs_s) - half_length,
+                    "front_s": float(obs_s) + half_length,
+                    "pass_lateral": route_pass_lateral,
+                    "bypass_start_distance": float(self._model.obstacle_bypass_start_distance),
+                    "bypass_full_distance": float(self._model.obstacle_bypass_full_distance),
+                    "return_front_clearance_lengths": float(self._model.obstacle_return_front_clearance_lengths),
+                    "return_distance": float(self._model.obstacle_return_distance),
+                    "reference_lateral_limit": float(self._obstacle_reference_lateral_limit),
+                }
+            candidates.append(
+                candidate
+            )
+
+        candidates.sort(key=lambda item: item["rear_s"])
+        clusters = []
+        cluster_gap = float(self._model.obstacle_cluster_gap)
+        for candidate in candidates:
+            merged = False
+            for cluster in clusters:
+                if (
+                    abs(candidate["pass_lateral"]) > 1e-6
+                    and abs(cluster["pass_lateral"]) > 1e-6
+                    and candidate["pass_lateral"] * cluster["pass_lateral"] <= 0.0
+                ):
+                    continue
+                gap = max(
+                    candidate["rear_s"] - cluster["front_s"],
+                    cluster["rear_s"] - candidate["front_s"],
+                    0.0,
+                )
+                if gap > cluster_gap:
+                    continue
+
+                cluster["rear_s"] = min(cluster["rear_s"], candidate["rear_s"])
+                cluster["front_s"] = max(cluster["front_s"], candidate["front_s"])
+                cluster["bypass_start_distance"] = max(
+                    float(cluster.get("bypass_start_distance", self._model.obstacle_bypass_start_distance)),
+                    float(candidate.get("bypass_start_distance", self._model.obstacle_bypass_start_distance)),
+                )
+                cluster["bypass_full_distance"] = max(
+                    float(cluster.get("bypass_full_distance", self._model.obstacle_bypass_full_distance)),
+                    float(candidate.get("bypass_full_distance", self._model.obstacle_bypass_full_distance)),
+                )
+                cluster["return_front_clearance_lengths"] = max(
+                    float(cluster.get("return_front_clearance_lengths", self._model.obstacle_return_front_clearance_lengths)),
+                    float(candidate.get("return_front_clearance_lengths", self._model.obstacle_return_front_clearance_lengths)),
+                )
+                cluster["return_distance"] = max(
+                    float(cluster.get("return_distance", self._model.obstacle_return_distance)),
+                    float(candidate.get("return_distance", self._model.obstacle_return_distance)),
+                )
+                if abs(candidate["pass_lateral"]) > 1e-6:
+                    if abs(cluster["pass_lateral"]) <= 1e-6:
+                        cluster["pass_lateral"] = candidate["pass_lateral"]
+                    else:
+                        cluster["pass_lateral"] = math.copysign(
+                            max(abs(cluster["pass_lateral"]), abs(candidate["pass_lateral"])),
+                            cluster["pass_lateral"],
+                        )
+                merged = True
                 break
-        
-        # 从队列左侧（队首）移除已通过的路径点
-        if num_waypoint_removed > 0:
-            for _ in range(num_waypoint_removed):
-                self._waypoints_queue.popleft()
 
+            if not merged:
+                clusters.append(dict(candidate))
 
-        # -------------------------------------------
-        # 4.5 障碍物避让：直接偏移参考轨迹
-        # -------------------------------------------
-        # 使用车辆当前航向角（从current_state获取）
-        ego_yaw_for_offset = current_state[2]
-        waypoints = self.apply_obs_avoidance_offset(
-            waypoints, current_state[0], current_state[1], ego_yaw_for_offset
+        return [cluster for cluster in clusters if abs(cluster["pass_lateral"]) > 1e-6]
+
+    def _route_bypass_profile(self, path_s, cluster):
+        ego_half_length = float(self._model.ego_footprint_half_length)
+        bypass_start_distance = float(
+            cluster.get("bypass_start_distance", self._model.obstacle_bypass_start_distance)
+        )
+        bypass_full_distance = float(
+            cluster.get("bypass_full_distance", self._model.obstacle_bypass_full_distance)
+        )
+        return_front_clearance_lengths = float(
+            cluster.get(
+                "return_front_clearance_lengths",
+                self._model.obstacle_return_front_clearance_lengths,
+            )
+        )
+        return_distance = float(
+            cluster.get("return_distance", self._model.obstacle_return_distance)
         )
 
-
-        # -------------------------------------------
-        # 5. 三次样条插值生成平滑路径
-        # -------------------------------------------
-
-        #cx，cy，cyaw为插值后的密集的x，y坐标，yaw；
-        #ck插值后所有点的曲率。ck ≈ 1/转弯半径，ck 很小（趋近 0）→ 直线行驶，ck很大→ 急弯；曲率在 MPC 控制器里很有用，可以提前知道前方弯道有多大，据此调整速度。
-        #ds采样间隔，比如 0.5 表示每隔 0.5 米输出一个点
-        #插值后每个点的 累计路程（从起点到该点的弧长）
-        cx, cy, cyaw, ck, s = itp.calc_spline_course_carla(
-            waypoints[0], waypoints[1], waypoints[3][0], ds=self._d_dist
+        entry_start = cluster["rear_s"] - ego_half_length - bypass_start_distance
+        entry_full = cluster["rear_s"] - ego_half_length - bypass_full_distance
+        return_start = cluster["front_s"] + max(
+            (2.0 * return_front_clearance_lengths - 1.0) * ego_half_length,
+            0.0,
         )
-        # 根据路径曲率生成速度剖面，这行代码的作用是根据参考轨迹的曲率，生成一个速度规划数组。
-        #sp 是一个与 cx, cy 等长的数组，每个元素对应轨迹上每个点的推荐速度：
-        #sp = [5.0, 5.0, 5.0, 4.8, 4.5, 3.2, 2.0, 1.5, 0.5, 0.0, ...]
-        #↑       ↑        ↑      ↑         ↑
-        #
-        #直线    弯道前   弯道中  快到终点   停止
+        return_end = return_start + return_distance
 
-        sp = itp.calc_speed_profile(cx, cy, cyaw, self._model.target_v)
-        
-        # 封装为路径对象
-        ref_path = itp.PATH(cx, cy, cyaw, ck)
-
-
-
-        # -------------------------------------------
-        # 6. 计算T步参考轨迹
-        # -------------------------------------------
-        #输出含义ind，当前路径点索引，最近路径点在cx, cy 数组中的索引
-        # z_ref: 参考轨迹[4, T + 1]，包含[x, y, v, yaw]
-        # [x_0,    x_1,     x_2,     x_3,    ...,   x_T]
-        # [y_0,    y_1,     y_2,     y_3,    ...,   y_T]
-        # [v_0,    v_1,     v_2,     v_3,    ...,   v_T]
-        # [yaw_0, yaw_1,  yaw_2,  yaw_3,  ...,  yaw_T]
-
-
-        z_ref, target_ind = self.calc_ref_trajectory_in_T_step(
-            [current_state[0], current_state[1], v, current_state[2]],
-            ref_path, sp
+        if path_s <= entry_start or path_s >= return_end:
+            return 0.0
+        if path_s < entry_full:
+            return self._smoothstep_value(
+                (path_s - entry_start) / max(entry_full - entry_start, 1e-6)
+            )
+        if path_s <= return_start:
+            return 1.0
+        return 1.0 - self._smoothstep_value(
+            (path_s - return_start) / max(return_end - return_start, 1e-6)
         )
 
-        
-        # 转换为MPC需要的状态格式 [x, y, yaw, vx, vy, omega]，6维状态向量，[:, :self._model.horizon]切片，切掉最后一列
-        ref_traj = np.array([
-            z_ref[0], z_ref[1], z_ref[3], z_ref[2],  # x, y, yaw, v
-            [0] * len(z_ref[0]),  # vy = 0
-            [0] * len(z_ref[0])   # omega = 0
-        ])[:, :self._model.horizon]
-        
-        # -------------------------------------------
-        # 7. MPC求解
-        # -------------------------------------------
-        # 11行×6列，每一行 [x, y, yaw, vx, vy, omega]是一个时间步的状态：
-        if self._next_states is None:
-            self._next_states = np.zeros(
-                (self._model.n_states, self._model.horizon + 1)
-            ).T
-        
-        # 更新当前速度
-        cur_v = self._model.get_v()
-        #把预测序列中每一行的vx（纵向速度）都填成当前速度cur_v，作为MPC求解的初始猜测。
-        self._next_states[:, 3] = cur_v
-        #把current_state中的速度分量vx,vy,omega更新为预测序列第 0 行（当前时刻）的值，保持一致。
-        current_state[3:] = self._next_states[0][3:]
-        
-        # 使用上一时刻的控制序列作为热启动，u0为输入
-        u0 = np.array([self._a_opt, self._delta_opt]).reshape(-1, 2).T
-        #u0形状: (2, T)时间步0 到T：
-        #加速度: [a0, a1, a2, ..., aT]
-        #转向角: [δ0, δ1, δ2, ..., δT]
+    def _route_bypass_offset(self, path_s, clusters, legal_bounds=None):
+        if not clusters:
+            return 0.0
 
-        # -------------------------------------------
-        # 7.5 障碍物接近检测：决定是否用冷启动
-        # -------------------------------------------
-        # 如果障碍物在势场范围内，使用冷启动帮助跳出局部最优
-        # (暂时禁用，恢复热启动)
-
-        # 添加势场代价（障碍物、道路边界等，目前为0）
-        apf_obs = apf_nc_road = apf_c_road = 0
-        
-        # 构建MPC优化问题
-        self._model.solver_add_cost()      # 定义代价函数
-        
-        # 调试：打印障碍物信息
-
-        
-        if self._obstacles is not None and len(self._obstacles) > 0:
-            log(f"[DEBUG] 障碍物数量: {len(self._obstacles)}, 位置: {self._obstacles}")
+        best_offset = 0.0
+        if legal_bounds is None:
+            left_bound = self._lane_bound_inactive
+            right_bound = self._lane_bound_inactive
         else:
-            log("[DEBUG] 无障碍物")
-        
-        self._model.solver_add_soft_obs(self._obstacles)  # 添加软障碍物避让约束
-        self._model.solver_add_bounds()  # 添加约束条件
-        
-        # 求解MPC
+            left_bound = max(float(legal_bounds[0]), 0.0)
+            right_bound = max(float(legal_bounds[1]), 0.0)
+        for cluster in clusters:
+            profile = self._route_bypass_profile(path_s, cluster)
+            if profile <= 0.0:
+                continue
+            pass_lateral = float(cluster["pass_lateral"])
+            side_clearance = min(
+                float(self._model.obstacle_side_clearance),
+                float(cluster.get("reference_lateral_limit", self._obstacle_reference_lateral_limit)),
+            )
+            desired_lateral = math.copysign(
+                min(abs(pass_lateral), side_clearance),
+                pass_lateral,
+            )
+            if not self._lane_bound_supports_offset(desired_lateral, (left_bound, right_bound)):
+                continue
+            target_lateral = float(np.clip(desired_lateral, -right_bound, left_bound))
+            offset = profile * target_lateral
+            if abs(offset) > abs(best_offset):
+                best_offset = offset
+        return best_offset
+
+    def _sample_shifted_reference_position(self, cache, path_s, bypass_clusters, legal_bounds=None):
+        pos, ref_yaw = self._sample_path(
+            cache["path_points"],
+            cache["arc_lengths"],
+            cache["segment_lengths"],
+            path_s,
+        )
+        offset = self._route_bypass_offset(path_s, bypass_clusters, legal_bounds=legal_bounds)
+        if abs(offset) <= 1e-6:
+            return pos
+        left_axis = np.array([-math.sin(ref_yaw), math.cos(ref_yaw)], dtype=float)
+        return pos + offset * left_axis
+
+    def _sample_shifted_reference(self, cache, path_s, bypass_clusters, lane_bounds_path):
+        path_s = float(np.clip(path_s, 0.0, cache["arc_lengths"][-1]))
+        pos = self._sample_shifted_reference_position(
+            cache,
+            path_s,
+            bypass_clusters,
+            legal_bounds=self._sample_path_bounds(
+                lane_bounds_path,
+                cache["arc_lengths"],
+                cache["segment_lengths"],
+                path_s,
+            ),
+        )
+        s0 = max(path_s - self._reference_yaw_window, 0.0)
+        s1 = min(path_s + self._reference_yaw_window, cache["arc_lengths"][-1])
+        p0 = self._sample_shifted_reference_position(
+            cache,
+            s0,
+            bypass_clusters,
+            legal_bounds=self._sample_path_bounds(
+                lane_bounds_path,
+                cache["arc_lengths"],
+                cache["segment_lengths"],
+                s0,
+            ),
+        )
+        p1 = self._sample_shifted_reference_position(
+            cache,
+            s1,
+            bypass_clusters,
+            legal_bounds=self._sample_path_bounds(
+                lane_bounds_path,
+                cache["arc_lengths"],
+                cache["segment_lengths"],
+                s1,
+            ),
+        )
+        delta = p1 - p0
+        if np.linalg.norm(delta) < 1e-6:
+            _, ref_yaw = self._sample_path(
+                cache["path_points"],
+                cache["arc_lengths"],
+                cache["segment_lengths"],
+                path_s,
+            )
+            return pos, ref_yaw
+        return pos, float(np.arctan2(delta[1], delta[0]))
+
+    def _build_reference(self, x, y, yaw, speed, obstacles=None):
+        cache = self._route_cache
+        geometry = self._window_geometry_from_route_cache()
+        if cache is None or geometry is None:
+            ref_rows = np.array([[x, y, yaw, self._model.target_v, 0.0, 0.0] for _ in range(self._model.horizon)], dtype=float)
+            lane_bound_rows = np.full((self._model.horizon + 1, 2), self._lane_bound_inactive, dtype=float)
+            return ref_rows, lane_bound_rows
+        path_points, segment_lengths, arc_lengths, origin_s, lane_bounds_path = geometry
+        total_s = float(arc_lengths[-1])
+        projection_limit = max(
+            self._projection_min_lookahead,
+            self._base_min_distance + self._projection_time_lookahead * max(speed, 0.0),
+        )
+        current_s, _, _, current_lateral = self._project_to_path(
+            [x, y],
+            path_points,
+            arc_lengths,
+            segment_lengths,
+            min_s=0.0,
+            max_s=min(projection_limit, total_s),
+            heading_yaw=yaw,
+        )
+        speed_profile = cache["speed_profile"]
+        bypass_clusters = []
+        reference_bypass_clusters = []
+        if self.enable_obstacle_avoidance:
+            local_cache = {
+                "path_points": path_points,
+                "segment_lengths": segment_lengths,
+                "arc_lengths": arc_lengths,
+                "lane_bounds": lane_bounds_path,
+            }
+            bypass_clusters = self._build_route_bypass_clusters(obstacles, local_cache, current_s=current_s)
+            if self.enable_obstacle_reference_shaping:
+                reference_bypass_clusters = bypass_clusters
+        rows = []
+        lane_bound_rows = [self._sample_path_bounds(lane_bounds_path, arc_lengths, segment_lengths, current_s)]
+        path_s = current_s
+        ref_yaw_anchor = float(yaw)
+        for _ in range(self._model.horizon):
+            legal_bounds = self._sample_path_bounds(
+                lane_bounds_path,
+                arc_lengths,
+                segment_lengths,
+                path_s,
+            )
+            reference_lateral = 0.0
+            if reference_bypass_clusters:
+                local_cache = {
+                    "path_points": path_points,
+                    "segment_lengths": segment_lengths,
+                    "arc_lengths": arc_lengths,
+                }
+                reference_lateral = self._route_bypass_offset(
+                    path_s,
+                    reference_bypass_clusters,
+                    legal_bounds=legal_bounds,
+                )
+                pos, ref_yaw = self._sample_shifted_reference(
+                    local_cache,
+                    path_s,
+                    reference_bypass_clusters,
+                    lane_bounds_path,
+                )
+            else:
+                pos, ref_yaw = self._sample_path(path_points, arc_lengths, segment_lengths, path_s)
+            ref_yaw = self._unwrap_angle(ref_yaw, anchor=ref_yaw_anchor)
+            ref_yaw_anchor = ref_yaw
+            profile_s = origin_s + path_s
+            ref_speed = self._speed_at_profile_s(speed_profile, profile_s)
+            obstacle_cache = {
+                "path_points": path_points,
+                "segment_lengths": segment_lengths,
+                "arc_lengths": arc_lengths,
+                "lane_bounds": lane_bounds_path,
+                "ego_lateral_now": float(current_lateral),
+                "reference_lateral": float(reference_lateral),
+            }
+            ref_speed = min(ref_speed, self._obstacle_speed_limit_at(path_s, obstacles, obstacle_cache))
+            rows.append([pos[0], pos[1], ref_yaw, ref_speed, 0.0, 0.0])
+            lane_bound_rows.append(legal_bounds)
+            next_profile_s = self._advance_reference_s(profile_s, speed_profile, float(cache["arc_lengths"][-1]))
+            path_s = min(max(next_profile_s - origin_s, path_s), total_s)
+        self._last_reference_speed = float(rows[0][3])
+        return np.asarray(rows, dtype=float), np.asarray(lane_bound_rows, dtype=float)
+
+    def _collect_obstacles(self):
+        obstacles = []
+        if self._obstacles is not None and len(self._obstacles) > 0:
+            for item in np.asarray(self._obstacles, dtype=float):
+                item = np.asarray(item, dtype=float).flatten()
+                if len(item) < 2:
+                    continue
+                obstacles.append(
+                    [
+                        float(item[0]),
+                        float(item[1]),
+                        float(item[2]) if len(item) > 2 else 0.0,
+                        float(item[3]) if len(item) > 3 else 1.2,
+                        float(item[4]) if len(item) > 4 else 2.2,
+                        float(item[5]) if len(item) > 5 else 0.0,
+                        float(item[6]) if len(item) > 6 else 1.0,
+                        float(item[7]) if len(item) > 7 else 0.0,
+                        float(item[8]) if len(item) > 8 else 0.0,
+                        float(item[9]) if len(item) > 9 else 0.0,
+                    ]
+                )
+        if self.enable_obstacle_avoidance and hasattr(self._env, "get_obstacle_states"):
+            for item in self._env.get_obstacle_states(
+                max_distance=self.obstacle_detection_range,
+                include_walkers=False,
+                front_only=True,
+                rear_release_distance=75.0,
+            ):
+                if len(item) >= 2:
+                    speed = math.hypot(float(item[2]), float(item[3])) if len(item) > 3 else 0.0
+                    obstacles.append(
+                        [
+                            float(item[0]),
+                            float(item[1]),
+                            float(item[6]) if len(item) > 6 else 0.0,
+                            float(item[4]) if len(item) > 4 else 1.2,
+                            float(item[5]) if len(item) > 5 else 2.2,
+                            speed,
+                            float(item[7]) if len(item) > 7 else 1.0,
+                            float(item[8]) if len(item) > 8 else 0.0,
+                            float(item[2]) if len(item) > 2 else 0.0,
+                            float(item[3]) if len(item) > 3 else 0.0,
+                        ]
+                    )
+        if not obstacles:
+            return None
+        return np.asarray(obstacles, dtype=float)
+
+    def _collect_pedestrians(self):
+        if not hasattr(self._env, "get_pedestrian_states"):
+            return None
+        pedestrians = self._env.get_pedestrian_states()
+        if not pedestrians:
+            return None
+        ped_arr = np.asarray(pedestrians, dtype=float)
+        if ped_arr.ndim == 1:
+            ped_arr = ped_arr.reshape(1, -1)
+        return ped_arr
+
+    def _should_enforce_lane_bounds(self, obstacles):
+        if obstacles is None or len(obstacles) == 0:
+            return False
+
+        obstacle_rows = np.asarray(obstacles, dtype=float)
+        if obstacle_rows.ndim == 1:
+            obstacle_rows = obstacle_rows.reshape(1, -1)
+
+        static_speed_threshold = float(getattr(self._model, "obstacle_static_speed_threshold", 0.5))
+        for row in obstacle_rows:
+            if row.shape[0] < 7:
+                continue
+            obs_speed = float(row[5]) if row.shape[0] > 5 else 0.0
+            is_vehicle = float(row[6]) if row.shape[0] > 6 else 1.0
+            if is_vehicle >= 0.5 and obs_speed > static_speed_threshold:
+                return True
+        return False
+
+    def _route_progress_and_lateral(self, point_xy):
+        cache = self._route_cache
+        if cache is None:
+            return float("inf"), float("inf")
+        total_s = float(cache["arc_lengths"][-1])
+        projected_s, _, _, lateral = self._project_to_path(
+            point_xy,
+            cache["path_points"],
+            cache["arc_lengths"],
+            cache["segment_lengths"],
+            min_s=max(self._route_progress_s - 5.0, 0.0),
+            max_s=min(self._route_progress_s + self._pedestrian_yield_distance + 25.0, total_s),
+        )
+        return float(projected_s - self._route_progress_s), float(lateral)
+
+    def _apply_pedestrian_brake(self, a_cmd, ego_speed, predicted_states, pedestrians):
+        if pedestrians is None or len(pedestrians) == 0:
+            return a_cmd
+
+        ped_arr = np.asarray(pedestrians, dtype=float)
+        if ped_arr.ndim == 1:
+            ped_arr = ped_arr.reshape(1, -1)
+
+        moving_pedestrian_seen = False
+        closest_yield_ahead = float("inf")
+        min_path_dist = float("inf")
+
+        for pedestrian in ped_arr:
+            if pedestrian.shape[0] < 4:
+                continue
+            ped_vx = float(pedestrian[2])
+            ped_vy = float(pedestrian[3])
+            if math.hypot(ped_vx, ped_vy) < 0.05:
+                continue
+
+            moving_pedestrian_seen = True
+            for dt in np.linspace(0.0, self._pedestrian_crossing_lookahead_time, 17):
+                ped_xy = np.array(
+                    [
+                        float(pedestrian[0]) + ped_vx * dt,
+                        float(pedestrian[1]) + ped_vy * dt,
+                    ],
+                    dtype=float,
+                )
+                ahead, lateral = self._route_progress_and_lateral(ped_xy)
+                if 0.0 < ahead < self._pedestrian_yield_distance and abs(lateral) <= self._pedestrian_path_half_width:
+                    closest_yield_ahead = min(closest_yield_ahead, ahead)
+                    break
+
+        horizon = min(len(predicted_states), self._model.horizon)
+        for step in range(horizon):
+            state = np.asarray(predicted_states[step], dtype=float)
+            dt = step * self._dt
+            for pedestrian in ped_arr:
+                if pedestrian.shape[0] < 4:
+                    continue
+                ped_vx = float(pedestrian[2])
+                ped_vy = float(pedestrian[3])
+                if math.hypot(ped_vx, ped_vy) < 0.05:
+                    continue
+
+                ped_x = float(pedestrian[0]) + ped_vx * dt
+                ped_y = float(pedestrian[1]) + ped_vy * dt
+                ahead, lateral = self._route_progress_and_lateral([ped_x, ped_y])
+                if 0.0 <= ahead <= self._pedestrian_yield_distance and abs(lateral) <= self._pedestrian_release_lateral:
+                    min_path_dist = min(min_path_dist, math.hypot(state[0] - ped_x, state[1] - ped_y))
+
+        if not moving_pedestrian_seen:
+            return a_cmd
+
+        should_yield = closest_yield_ahead < float("inf")
+        if not should_yield and min_path_dist >= self._pedestrian_safe_dist:
+            return a_cmd
+
+        target_decel = 0.0
+        if should_yield:
+            stop_distance = max(closest_yield_ahead - self._pedestrian_stop_buffer, 1.0)
+            target_decel = ego_speed * ego_speed / (2.0 * stop_distance)
+            target_decel = float(
+                np.clip(
+                    target_decel + 0.1,
+                    self._pedestrian_min_decel,
+                    self._pedestrian_strong_decel,
+                )
+            )
+
+        if min_path_dist < 0.8:
+            target_decel = max(target_decel, 4.0)
+        elif min_path_dist < 1.1:
+            target_decel = max(target_decel, 2.2)
+        elif min_path_dist < 1.5:
+            target_decel = max(target_decel, 1.4)
+        elif min_path_dist < self._pedestrian_safe_dist:
+            target_decel = max(target_decel, self._pedestrian_comfort_decel)
+
+        if ego_speed < 0.2 and should_yield:
+            target_decel = max(target_decel, self._pedestrian_min_decel)
+        if target_decel <= 0.0:
+            return a_cmd
+        return min(float(a_cmd), -target_decel)
+
+    def _apply_dynamic_vehicle_brake(self, a_cmd, ego_speed, predicted_states, obstacles):
+        if obstacles is None or len(obstacles) == 0:
+            return a_cmd
+
+        obstacle_rows = np.asarray(obstacles, dtype=float)
+        if obstacle_rows.ndim == 1:
+            obstacle_rows = obstacle_rows.reshape(1, -1)
+
+        static_speed_threshold = float(getattr(self._model, "obstacle_static_speed_threshold", 0.5))
+        horizon = min(len(predicted_states), self._model.horizon + 1)
+        if horizon <= 0:
+            return a_cmd
+
+        min_predicted_clearance = float("inf")
+
+        for obstacle in obstacle_rows:
+            if obstacle.shape[0] < 10:
+                continue
+
+            obs_speed = float(obstacle[5]) if obstacle.shape[0] > 5 else 0.0
+            is_vehicle = float(obstacle[6]) if obstacle.shape[0] > 6 else 1.0
+            if is_vehicle < 0.5 or obs_speed <= static_speed_threshold:
+                continue
+
+            current_ahead, obstacle_lateral_now = self._route_progress_and_lateral(obstacle[:2])
+            if (
+                current_ahead < -self._dynamic_vehicle_rear_release_clearance
+                or current_ahead > self._dynamic_vehicle_yield_distance + 20.0
+                or abs(obstacle_lateral_now) > self._dynamic_vehicle_watch_lateral
+            ):
+                continue
+
+            radius = max(
+                float(obstacle[3]) if obstacle.shape[0] > 3 else self._model.obstacle_min_radius,
+                float(self._model.obstacle_min_radius),
+            )
+            half_length = max(
+                float(obstacle[4]) if obstacle.shape[0] > 4 else self._model.obstacle_longitudinal_min_half,
+                float(self._model.obstacle_longitudinal_min_half),
+            )
+            pass_lateral = abs(float(obstacle[7])) if obstacle.shape[0] > 7 else 0.0
+            vx = float(obstacle[8])
+            vy = float(obstacle[9])
+            local_predicted_clearance = float("inf")
+
+            for step in range(horizon):
+                dt = step * self._dt
+                obs_xy = np.array(
+                    [
+                        float(obstacle[0]) + vx * dt,
+                        float(obstacle[1]) + vy * dt,
+                    ],
+                    dtype=float,
+                )
+                ahead, lateral = self._route_progress_and_lateral(obs_xy)
+                ego_state = np.asarray(predicted_states[step], dtype=float)
+                ego_ahead, ego_lateral = self._route_progress_and_lateral(ego_state[:2])
+                route_clearance = (
+                    ahead
+                    - ego_ahead
+                    - half_length
+                    - float(self._model.ego_footprint_half_length)
+                )
+                if (
+                    route_clearance < -self._dynamic_vehicle_rear_release_clearance
+                    or route_clearance > self._dynamic_vehicle_yield_distance
+                    or abs(lateral) > self._dynamic_vehicle_watch_lateral
+                ):
+                    continue
+                route_lateral_gap = abs(float(ego_lateral) - float(lateral))
+                conflict_lateral = max(
+                    self._dynamic_vehicle_conflict_lateral,
+                    radius + float(self._model.ego_footprint_radius) + 0.1,
+                )
+                early_release_lateral = max(1.5, 0.55 * pass_lateral) if pass_lateral > 1e-6 else 1.5
+                if route_lateral_gap >= early_release_lateral and route_clearance > -1.4:
+                    continue
+                desired_lateral_gap = max(pass_lateral, conflict_lateral, 1e-3)
+                lateral_progress = float(
+                    np.clip(route_lateral_gap / desired_lateral_gap, 0.0, 1.0)
+                )
+                if route_lateral_gap >= conflict_lateral:
+                    continue
+                if lateral_progress >= 0.32 and route_clearance > -1.4:
+                    continue
+                center_clearance = (
+                    math.hypot(ego_state[0] - obs_xy[0], ego_state[1] - obs_xy[1])
+                    - radius
+                    - float(self._model.ego_footprint_radius)
+                )
+                local_predicted_clearance = min(local_predicted_clearance, center_clearance)
+
+            min_predicted_clearance = min(min_predicted_clearance, local_predicted_clearance)
+
+        if self._debug_log_enabled and min_predicted_clearance < 2.0:
+            self._append_debug_log(
+                "[DYN-BRAKE] "
+                f"ego_v={ego_speed:.2f} min_clear={min_predicted_clearance:.2f} a_in={float(a_cmd):.2f}"
+            )
+
+        if min_predicted_clearance < 0.80:
+            return min(float(a_cmd), -4.8)
+        elif min_predicted_clearance < 1.20:
+            return min(float(a_cmd), -3.2)
+        elif min_predicted_clearance < self._dynamic_vehicle_safe_dist:
+            return min(float(a_cmd), -self._dynamic_vehicle_comfort_decel)
+        return a_cmd
+
+    def run_step(self, lv=None):
+        state, height = self._model.get_state_carla()
+        x, y, yaw_deg, vx, vy, omega = state
+        yaw = self._unwrap_angle(math.radians(yaw_deg))
+        speed = math.sqrt(vx * vx + vy * vy)
+        current_state = np.array([x, y, yaw, speed, 0.0, math.radians(omega)], dtype=float)
+
+        self._update_route_progress(x, y, yaw, speed)
+        if len(self._waypoints_queue) == 0:
+            raise StopIteration("No waypoints to follow")
+
+        obstacles = self._collect_obstacles()
+        pedestrians = self._collect_pedestrians()
+        ref_traj, lane_bounds = self._build_reference(x, y, yaw, speed, obstacles)
+        if self._next_states is None:
+            self._next_states = np.zeros((self._model.horizon + 1, self._model.n_states), dtype=float)
+        self._next_states[:, 3] = speed
+        self._next_states[0] = current_state
+        u0 = np.column_stack((self._a_opt, self._delta_opt))
         state = self._model.solve_MPC(
-            ref_traj.T, current_state, self._next_states, u0
+            ref_traj,
+            current_state,
+            self._next_states,
+            u0,
+            previous_control=self._last_control,
+            obstacles=obstacles,
+            lane_bounds=lane_bounds if self._should_enforce_lane_bounds(obstacles) else None,
         )
-        
-        # 调试：打印求解返回
-        log(f"[DEBUG solve_MPC返回] len(state)={len(state)}, type={type(state)}")
-        
-        # -------------------------------------------
-        # 8. 可视化预测轨迹
-        # -------------------------------------------
-        # 绘制参考轨迹红色 (255，0，0)，[:2, :]前2行
-        ca_u.draw_planned_trj(
-            self._world, state[2][:, :2], height + 0.5, color=(255,0,0)
+        self._last_min_obstacle_clearance = getattr(
+            self._model,
+            "last_min_obstacle_clearance",
+            float("inf"),
         )
 
+        if self._draw_planned_trj:
+            ca_u.draw_planned_trj(self._world, state[2][:, :2], height + 0.5, color=(255, 0, 0))
 
-        # 保存预测状态序列（用于下一时刻热启动）
-        self._next_states = state[2]
-        
-        # -------------------------------------------
-        # 9. 准备返回数据
-        # -------------------------------------------
-        next_state = state[2][1]
-        self._a_opt = state[0]     # 更新最优加速度序列
-        self._delta_opt = state[1]  # 更新最优转向角序列
-        
-        # 调试：打印控制输出
-        log(f"[DEBUG] a_opt: {self._a_opt[0]:.3f}, delta_opt: {self._delta_opt[0]:.3f}")
-        log(f"[DEBUG] 下一状态: x={next_state[0]:.1f}, y={next_state[1]:.1f}, v={next_state[3]:.1f}")
-        
-        # 用动力学模型预测实际下一状态
-        next_state = self._model.predict(
-            current_state, (self._a_opt[0], self._delta_opt[0])
-        )
-        self._model.set_state(next_state)  # 更新模型内部状态
-        
-        # -------------------------------------------
-        # 10. 计算跟踪误差（用于日志/调试）
-        # -------------------------------------------
-        # 横向误差：使用PATH类的nearest_index方法获取真正的横向偏差
-        # ind: 最近路径点索引, er: 横向偏差（正=车辆偏左，负=车辆偏右）
-        _, dist_error = ref_path.nearest_index(
-            [current_state[0], current_state[1], current_state[2]]
-        )
-        
-        # 指数平滑滤波：消减突变尖峰
-        # y_filtered = alpha * y_raw + (1-alpha) * y_old
-        dist_error_filtered = self._filter_alpha * dist_error + (1 - self._filter_alpha) * self._dist_error_old
-        self._dist_error_old = dist_error_filtered  # 保存供下一帧使用
-        
-        yaw_error = abs(next_state[2] - ref_traj[2, 1])
-        vel_error = abs(state[2][0][3] - ref_traj[3, 0])
-        
-        # 当前控制输出
-        acc = self._a_opt[0]
-        steer = self._delta_opt[0]
-        
-        # 求解耗时time_2
-        cost_time = state[-1]
+        a_sequence = np.asarray(state[0], dtype=float)
+        delta_sequence = np.asarray(state[1], dtype=float)
+        a_cmd = float(a_sequence[0])
+        delta_cmd = float(delta_sequence[0])
+        a_cmd = self._apply_dynamic_vehicle_brake(a_cmd, speed, state[2], obstacles)
+        a_cmd = self._apply_pedestrian_brake(a_cmd, speed, state[2], pedestrians)
+        next_state = self._model.predict(current_state, (a_cmd, delta_cmd))
+        self._model.set_state(next_state)
+        self._last_control = np.array([a_cmd, delta_cmd], dtype=float)
+        self._next_states = np.vstack((state[2][1:], state[2][-1:]))
+        self._a_opt = np.concatenate((a_sequence[1:], a_sequence[-1:]))
+        self._delta_opt = np.concatenate((delta_sequence[1:], delta_sequence[-1:]))
 
-        return self._a_opt[0], self._delta_opt[0], (next_state, height + 0.05), cost_time * 1000, dist_error
-    
-    def trace_route(self, start_location, end_location):
-        """
-        调用全局路径规划器计算路径
-        
-        参数：
-            start_location: 起点Location
-            end_location: 终点Location
-        
-        返回：
-            路径（Waypoint, RoadOption）列表
-        """
-        return self._global_planner.trace_route(start_location, end_location)
+        _, _, _, lateral_error = self._project_to_path(
+            [x, y],
+            self._route_cache["path_points"],
+            self._route_cache["arc_lengths"],
+            self._route_cache["segment_lengths"],
+            heading_yaw=yaw,
+        )
+        if self._debug_log_enabled:
+            self._append_debug_log(
+                f"[DEBUG] ref_speed={self._last_reference_speed:.3f}, "
+                f"a={a_cmd:.3f}, steer={delta_cmd:.3f}"
+            )
+        return a_cmd, delta_cmd, (next_state, height + 0.05), state[-1] * 1000.0, abs(lateral_error)

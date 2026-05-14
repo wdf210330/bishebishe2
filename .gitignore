@@ -1,0 +1,12 @@
+.idea/
+__pycache__/
+*/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+debug_logs/
+result/
+replay_pid*.log
+
+*.bak

@@ -1,0 +1,54 @@
+{
+  "display_name": "Town05 遮挡行人横穿",
+  "carla_map": "Town05",
+  "start_idx": 170,
+  "end_idx": 200,
+  "route_end_index": 144,
+  "target_v_kmh": 12.0,
+  "sample_res": 2.0,
+  "trajectory_xlim": [
+    -70,
+    110
+  ],
+  "trajectory_ylim": [
+    -95,
+    35
+  ],
+  "force_reload_world": true,
+  "route_draw_life_time": 3600.0,
+  "draw_route_debug": true,
+  "enable_obstacle_avoidance": true,
+  "enable_obstacle_reference_shaping": false,
+  "spawn_static_obstacles": true,
+  "static_obstacle_route_groups": [],
+  "static_obstacles": [
+    {
+      "route_index": 56,
+      "lateral_offset": -3.6
+    }
+  ],
+  "pedestrian_crossings": [
+    {
+      "route_index": 64,
+      "start_lateral_offset": 4.0,
+      "end_lateral_offset": -5.0,
+      "speed": 1.1,
+      "trigger_distance": 12.0
+    },
+    {
+      "route_index": 112,
+      "start_lateral_offset": -5.0,
+      "end_lateral_offset": 5.0,
+      "speed": 1.2,
+      "trigger_distance": 15.0
+    },
+    {
+      "route_index": 140,
+      "start_lateral_offset": -4.0,
+      "end_lateral_offset": 4.0,
+      "speed": 1.1,
+      "trigger_distance": 14.0
+    }
+  ],
+  "scripted_vehicle_obstacles": []
+}

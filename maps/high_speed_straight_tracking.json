@@ -1,0 +1,28 @@
+{
+  "display_name": "高速直道基准跟踪",
+  "carla_map": "Town10HD",
+  "start_idx": 92,
+  "end_idx": 86,
+  "route_end_index": 122,
+  "arrival_distance_m": 10.0,
+  "target_v_kmh": 40.0,
+  "sample_res": 2.0,
+  "trajectory_xlim": [
+    -60,
+    115
+  ],
+  "trajectory_ylim": [
+    -75,
+    140
+  ],
+  "force_reload_world": true,
+  "route_draw_life_time": 3600.0,
+  "draw_route_debug": true,
+  "enable_obstacle_avoidance": false,
+  "enable_obstacle_reference_shaping": false,
+  "spawn_static_obstacles": false,
+  "static_obstacle_route_groups": [],
+  "static_obstacles": [],
+  "pedestrian_crossings": [],
+  "scripted_vehicle_obstacles": []
+}

@@ -1,0 +1,52 @@
+{
+  "display_name": "双路口掉头跟踪",
+  "carla_map": "Town10HD",
+  "start_idx": 101,
+  "end_idx": 101,
+  "manual_route_points": [
+    [-87.3, 27.8],
+    [-50.0, 27.8],
+    [10.0, 27.8],
+    [17.0, 24.5],
+    [92.0, 24.5],
+    [94.0, 24.1],
+    [96.5, 22.6],
+    [98.5, 19.8],
+    [98.0, 16.8],
+    [95.6, 14.3],
+    [92.0, 13.1],
+    [50.0, 13.1],
+    [-10.0, 13.1],
+    [-17.0, 16.2],
+    [-92.0, 16.2],
+    [-94.0, 16.6],
+    [-96.5, 18.1],
+    [-98.5, 20.9],
+    [-98.0, 23.9],
+    [-95.6, 26.4],
+    [-92.0, 27.7],
+    [-87.3, 27.8]
+  ],
+  "route_repeat_count": 2,
+  "target_v_kmh": 10.0,
+  "sample_res": 1.0,
+  "max_sim_time_s": 420.0,
+  "trajectory_xlim": [
+    -120,
+    120
+  ],
+  "trajectory_ylim": [
+    5,
+    35
+  ],
+  "force_reload_world": true,
+  "route_draw_life_time": 3600.0,
+  "draw_route_debug": true,
+  "enable_obstacle_avoidance": false,
+  "enable_obstacle_reference_shaping": false,
+  "spawn_static_obstacles": false,
+  "static_obstacle_route_groups": [],
+  "static_obstacles": [],
+  "pedestrian_crossings": [],
+  "scripted_vehicle_obstacles": []
+}

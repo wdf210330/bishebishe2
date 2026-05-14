@@ -131,33 +131,17 @@ class GlobalRoutePlanner(object):
                 route_trace.append((current_waypoint, road_option))
                 
                 # -------------------------------------------
-                if edge['type'] in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
-                    change_wp = edge.get('change_waypoint', None)
-                    if change_wp is not None:
-                        current_waypoint = change_wp
-                    else:
-                        exit_wp = edge['exit_waypoint']
-                        n1, n2 = self._road_id_to_edge[exit_wp.road_id][exit_wp.section_id][exit_wp.lane_id]
-                        next_edge = self._graph.edges[n1, n2]
-                        if next_edge['path']:
-                            closest_index = self._find_closest_in_list(current_waypoint, next_edge['path'])
-                            closest_index = min(len(next_edge['path']) - 1, closest_index + 5)
-                            current_waypoint = next_edge['path'][closest_index]
-                        else:
-                            current_waypoint = next_edge['exit_waypoint']
-                        route_trace.append((current_waypoint, road_option))
+                exit_wp = edge['exit_waypoint']
+                n1, n2 = self._road_id_to_edge[exit_wp.road_id][exit_wp.section_id][exit_wp.lane_id]
+                next_edge = self._graph.edges[n1, n2]
+
+                if next_edge['path']:
+                    closest_index = self._find_closest_in_list(current_waypoint, next_edge['path'])
+                    closest_index = min(len(next_edge['path']) - 1, closest_index + 5)
+                    current_waypoint = next_edge['path'][closest_index]
                 else:
-                    exit_wp = edge['exit_waypoint']
-                    n1, n2 = self._road_id_to_edge[exit_wp.road_id][exit_wp.section_id][exit_wp.lane_id]
-                    next_edge = self._graph.edges[n1, n2]
-                    
-                    if next_edge['path']:
-                        closest_index = self._find_closest_in_list(current_waypoint, next_edge['path'])
-                        closest_index = min(len(next_edge['path']) - 1, closest_index + 5)
-                        current_waypoint = next_edge['path'][closest_index]
-                    else:
-                        current_waypoint = next_edge['exit_waypoint']
-                    route_trace.append((current_waypoint, road_option))
+                    current_waypoint = next_edge['exit_waypoint']
+                route_trace.append((current_waypoint, road_option))
             
             # -------------------------------------------
             # 车道保持：收集路径上的所有Waypoint

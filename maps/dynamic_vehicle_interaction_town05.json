@@ -1,0 +1,67 @@
+{
+  "display_name": "Town05 动态车辆交互",
+  "carla_map": "Town05",
+  "start_idx": 170,
+  "end_idx": 200,
+  "route_end_index": 144,
+  "arrival_distance_m": 8.0,
+  "target_v_kmh": 20.0,
+  "sample_res": 2.0,
+  "trajectory_xlim": [
+    -135,
+    100
+  ],
+  "trajectory_ylim": [
+    -95,
+    110
+  ],
+  "force_reload_world": true,
+  "route_draw_life_time": 3600.0,
+  "draw_route_debug": true,
+  "enable_obstacle_avoidance": true,
+  "enable_obstacle_reference_shaping": true,
+  "spawn_static_obstacles": false,
+  "static_obstacle_route_groups": [],
+  "static_obstacles": [],
+  "pedestrian_crossings": [],
+  "scripted_vehicle_obstacles": [
+    {
+      "route_index": 12,
+      "start_lateral_offset": 0.0,
+      "end_lateral_offset": 0.0,
+      "start_time": 0.0,
+      "duration": 60.0,
+      "speed_kmh": 6.0,
+      "remove_after_duration": true,
+      "remove_after_ego_passed_m": 10.0,
+      "freeze_after_ego_passed_s": 3.0
+    },
+    {
+      "route_index": 72,
+      "start_lateral_offset": -3.5,
+      "end_lateral_offset": 0.0,
+      "start_time": 999.0,
+      "trigger_distance": 20.0,
+      "duration": 90.0,
+      "lane_change_duration": 10.0,
+      "speed_kmh": 8.0,
+      "motion_type": "smooth_merge",
+      "merge_start_distance": 6.0,
+      "remove_after_duration": true,
+      "remove_after_ego_passed_m": 10.0,
+      "freeze_after_ego_passed_s": 3.0
+    },
+    {
+      "route_index": 105,
+      "start_lateral_offset": 0.0,
+      "end_lateral_offset": 0.0,
+      "start_time": 999.0,
+      "trigger_distance": 35.0,
+      "duration": 140.0,
+      "speed_kmh": 8.0,
+      "remove_after_duration": true,
+      "remove_after_ego_passed_m": 10.0,
+      "freeze_after_ego_passed_s": 3.0
+    }
+  ]
+}

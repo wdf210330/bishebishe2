@@ -1,619 +1,680 @@
 """
-env.py - CARLA仿真环境封装
-
-功能说明：
-    封装CARLA自动驾驶仿真器，提供统一的Python接口
-    支持两种显示模式（spec无渲染 / pygame图形界面）
-    负责车辆生成、控制信号转换、仿真步进等核心功能
-
-使用方法：
-    env = Env(display_method="spec")  # 创建环境（无渲染模式）
-    env.reset(spawn_point)            # 生成车辆
-    env.step([acc, steer])           # 发送控制指令
-    
-依赖：
-    - carla (CARLA Python API)
-    - pygame (可选，仅pygame模式需要)
+CARLA simulation environment wrapper.
 """
 
-import atexit
-import json
-import logging
-import os
-import random
 import math
-import datetime
-import sys
+import random
 
-# 添加父目录到路径（用于导入pgconfig等配置）
-try:
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-except IndexError:
-    pass
-
-import numpy as np
 import carla
-from pgconfig import *  # 导入配置文件
-
-# pygame为可选依赖，pygame模式需要安装
-try:
-    import pygame
-except ImportError:
-    pygame = None
-
-
-def draw_waypoints(world, waypoints, z=0.5, color=(255, 0, 0), life_time=100.0):
-    """
-    在CARLA世界中绘制路径点（用于可视化参考轨迹）
-    
-    参数：
-        world: CARLA世界对象
-        waypoints: 路径点列表（CARLA.Waypoint对象）
-        z: 抬升高度（米），避免点在地表重叠
-        color: RGB颜色元组，默认红色
-        life_time: 点的存活时间（秒），100秒足够长
-    
-    示例：
-        draw_waypoints(world, route_waypoints, z=0.5, color=(0, 255, 0))  # 绿色路径
-    """
-    color = carla.Color(r=color[0], g=color[1], b=color[2], a=255)
-    for w in waypoints:
-        t = w.transform
-        # 在原始位置基础上抬升z米
-        begin = t.location + carla.Location(z=z)
-        # 绘制一个点
-        world.debug.draw_point(begin, size=0.1, color=color, life_time=life_time)
+import numpy as np
+import pygame
 
 
 class Env:
-    """
-    CARLA仿真环境封装类
-    
-    功能：
-        - 连接CARLA仿真器
-        - 生成和管理自动驾驶车辆
-        - 提供标准化的控制接口
-        - 支持两种显示模式
-    
-    属性：
-        client: CARLA客户端
-        world: CARLA世界
-        map: 地图数据
-        ego_vehicle: 被控车辆
-        display_method: 显示模式 "spec" 或 "pygame"
-    """
-    
-    def __init__(self, host="localhost", port=2000, dt=0.05, 
-                 display_method="spec", steer_ratio=1/0.7):
-        """
-        初始化仿真环境
-        
-        参数：
-            host: CARLA服务器地址，默认本地
-            port: CARLA端口，默认2000
-            dt: 仿真步长（秒），默认0.05s=20Hz
-            display_method: 显示模式
-                - "spec": 无渲染模式，鸟瞰视角，跟踪车辆（省资源，推荐）
-                - "pygame": 图形界面，有HUD显示（需要pygame）
-            steer_ratio: 方向盘比例系数，默认1/0.7≈1.43
-                用于将转向角归一化值转换为实际转向角
-        """
-        # -------------------------------------------
-        # 连接CARLA服务器
-        # -------------------------------------------
-        self.client = carla.Client(host, port)
-        self.client.set_timeout(10.0)  # 10秒超时，防止卡死
-        
-        self.world = self.client.get_world()  # 获取当前世界
-        self.map = self.world.get_map()        # 获取地图
-        self.ego_vehicle = None                # 初始化车辆为空
-        self.actor_list = []                   # 管理所有生成的Actor
-        
-        # 显示相关属性（后续init_display初始化）
+    def __init__(
+        self,
+        display_method="spec",
+        dt=0.05,
+        max_steer_rad=0.7,
+        no_rendering=False,
+        town_name=None,
+        client_timeout=120.0,
+        force_reload_world=False,
+    ):
+        self.display_method = display_method
+        self.dt = dt
+        self.max_steer_rad = max(max_steer_rad, 1e-3)
+        self.no_rendering = no_rendering
+        self.town_name = town_name
+        self.throttle_acc_scale = 8.0
+        self.brake_acc_scale = 20.0
+        self.max_throttle = 0.50
+        self.max_brake = 0.25
+        self.launch_min_throttle = 0.14
+        self.launch_speed_threshold = 1.0
+        self.launch_max_throttle = 0.24
+        self.launch_release_speed = 2.5
+        self.accel_feedback_kp = 0.10
+        self.accel_feedback_ki = 0.015
+        self.accel_integral_limit = 3.0
+        self.brake_accel_feedback_kp = 0.005
+        self.longitudinal_accel_filter_alpha = 0.35
+        self.stopped_speed_threshold = 0.5
+        self.max_longitudinal_decel = 5.0
+        self._last_longitudinal_speed = None
+        self._filtered_longitudinal_accel = 0.0
+        self._accel_error_integral = 0.0
+        self.client_timeout = client_timeout
+
+        self.client = carla.Client("localhost", 2000)
+        self.client.set_timeout(client_timeout)
+        self.world = self.client.get_world()
+        if town_name is not None:
+            current_map_name = self.world.get_map().name
+            if force_reload_world or not current_map_name.endswith(town_name):
+                self.world = self.client.load_world(town_name)
+        self.map = self.world.get_map()
+
+        settings = carla.WorldSettings(
+            synchronous_mode=True,
+            fixed_delta_seconds=dt,
+            no_rendering_mode=no_rendering,
+        )
+        self.world.apply_settings(settings)
+
         self.display = None
-        self.camera_sensor = None
         self.hud = None
         self.clock = None
-        
-        # 控制参数
-        self.steer_ratio = steer_ratio
-        self.dt = dt
-        
-        # -------------------------------------------
-        # 配置仿真器设置
-        # -------------------------------------------
-        self.original_settings = self.world.get_settings()
-        self.world.apply_settings(carla.WorldSettings(
-            no_rendering_mode=False,           # 启用渲染
-            synchronous_mode=True,             # 同步模式（关键！）
-            fixed_delta_seconds=self.dt         # 固定仿真步长
-        ))
-        
-        self.display_method = display_method
-        
-        # spec模式：创建俯视视角跟随车辆
-        if self.display_method == "spec":
-            self.spectator = self.world.get_spectator()
-        
-        # 注册退出清理函数（程序结束时自动调用）
-        atexit.register(self.clean)
-    
-    def init_display(self, size=(1280, 720)):
-        """
-        初始化pygame图形界面（仅pygame模式需要）
-        
-        创建窗口、HUD和跟随摄像头
-        
-        参数：
-            size: 窗口分辨率，默认(1280, 720)
-        
-        异常：
-            RuntimeError: pygame未安装时抛出
-        """
-        if pygame is None:
-            raise RuntimeError("pygame is not installed or failed to import.")
-        
-        # 初始化pygame
-        pygame.init()
-        pygame.display.set_caption("MPC-Controller")
-        
-        # 创建窗口
-        self.display = pygame.display.set_mode(
-            size, 
-            pygame.HWSURFACE | pygame.DOUBLEBUF  # 硬件加速 + 双缓冲
+
+        self.spectator = self.world.get_spectator()
+        self.ego_vehicle = None
+
+        self.pedestrians = []
+        self.pedestrian_controllers = []
+        self.obstacle_vehicles = []
+        self.scripted_actor_velocities = {}
+        self.last_vehicle_pos = None
+        self.last_vehicle_control = None
+
+    def _reset_longitudinal_controller(self):
+        self._last_longitudinal_speed = None
+        self._filtered_longitudinal_accel = 0.0
+        self._accel_error_integral = 0.0
+
+    def _ego_speed(self):
+        if self.ego_vehicle is None:
+            return 0.0
+        velocity = self.ego_vehicle.get_velocity()
+        return math.sqrt(
+            velocity.x * velocity.x
+            + velocity.y * velocity.y
+            + velocity.z * velocity.z
         )
-        
-        # 创建HUD（显示速度、时间等信息）
-        self.hud = HUD(size[0], size[1])
-        
-        # 创建时钟（用于控制帧率）
-        self.clock = pygame.time.Clock()
-        
-        # -------------------------------------------
-        # 添加跟随摄像头
-        # -------------------------------------------
-        blueprint_library = self.world.get_blueprint_library()
-        camera_bp = blueprint_library.find("sensor.camera.rgb")  # RGB摄像头
-        camera_bp.set_attribute('image_size_x', str(self.hud.dim[0]))
-        camera_bp.set_attribute('image_size_y', str(self.hud.dim[1]))
-        
-        # 计算摄像头安装位置（车辆后方偏上）
-        vehicle = self.ego_vehicle
-        bound_x = 0.5 + vehicle.bounding_box.extent.x  # 车辆x方向半长
-        bound_y = 0.5 + vehicle.bounding_box.extent.y  # 车辆y方向半宽
-        bound_z = 0.5 + vehicle.bounding_box.extent.z  # 车辆z方向半高
-        
-        spawn_point = carla.Transform(
-            carla.Location(x=-3.0 * bound_x, y=0.0 * bound_y, z=3.0 * bound_z),
-            carla.Rotation(pitch=8.0)  # 微微俯视
-        )
-        
-        # 挂载摄像头到车辆（SpringArmGhost模式会有轻微晃动效果）
-        self.camera_sensor = self.world.spawn_actor(
-            camera_bp, 
-            spawn_point, 
-            attach_to=vehicle,
-            attachment_type=carla.AttachmentType.SpringArmGhost
-        )
-        
-        # 设置摄像头回调（每帧图像的处理函数）
-        self.camera_sensor.listen(lambda image: self.camera_callback(image))
-    
-    def camera_callback(self, image):
-        """
-        摄像头图像回调函数（每帧图像触发）
-        
-        将CARLA的图像数据转换为pygame可以显示的格式
-        
-        参数：
-            image: CARLA图像对象
-        """
-        # 将原始图像数据转换为numpy数组
-        array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
-        array = np.reshape(array, (image.height, image.width, 4))  # RGBA格式
-        array = array[:, :, :3]  # 只取RGB，去掉Alpha通道
-        array = array[:, :, ::-1]  # BGR -> RGB
-        
-        # 转换为pygame表面并显示
-        surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
-        self.display.blit(surface, (0, 0))
-    
-    def reset(self, spawn_point=None):
-        """
-        重置环境：在指定位置生成车辆
-        
-        参数：
-            spawn_point: CARLA出生点，如果为None则随机选择
-        
-        效果：
-            - 生成一辆Tesla Model 3（CARLA内置车辆）
-            - 将其设置为ego_vehicle
-            - 放入actor_list管理
-        """
-        # 如果未指定出生点，随机选择一个
-        if spawn_point is None:
-            spawn_point = random.choice(self.map.get_spawn_points())
-        
-        # 获取车辆蓝图（选择特斯拉Model 3）
-        blueprint_library = self.world.get_blueprint_library()
-        bp = blueprint_library.filter('model3')[0]  # filter返回列表，取第一个
-        
-        # 在指定位置生成车辆
-        self.ego_vehicle = self.world.spawn_actor(bp, spawn_point)
-        self.actor_list.append(self.ego_vehicle)  # 加入管理列表
-        
-        # 推进一帧（确保车辆完全生成）
-        self.world.tick()
-    
-    def get_cmd(self, action):
-        """
-        将MPC输出的控制量转换为CARLA车辆控制指令
-        
-        MPC输出的是物理单位：
-            - acc: 加速度（m/s²），正=加速，负=制动
-            - steer: 转向角（弧度）
-        
-        CARLA接受的是归一化值：
-            - throttle: [0, 1]，油门开度
-            - brake: [0, 1]，制动开度
-            - steer: [-1, 1]，方向盘归一化位置
-            - reverse: True/False，是否倒车
-        
-        参数：
-            action: [acc_cmd, steer_cmd] MPC控制输出
-        
-        返回：
-            (throttle, steer_norm, brake, reverse) CARLA控制元组
-        """
-        acc_cmd, steer_cmd = action
-        
-        # MPC内部用max_wheel_angle=1.22，这里用1/0.7≈1.43恢复
-        max_acc = 5.0      # 最大加速度（m/s²）
-        max_brake = 3.0   # 最大制动减速度（m/s²）
-        max_wheel_angle = 1.22  # 最大车轮转向角（弧度）
-        
-        # 转向角归一化到[-1, 1]
-        steer_norm = float(np.clip(steer_cmd / max_wheel_angle, -1.0, 1.0))
-        
-        # 处理加减速
-        if acc_cmd >= 0:
-            # 加速：throttle = acc/max_acc，归一化到[0,1]
-            throttle = float(np.clip(acc_cmd / max_acc, 0.0, 1.0))
-            brake = 0.0  # 不制动
-            reverse = False
+
+    def get_ego_longitudinal_acceleration(self):
+        if self.ego_vehicle is None:
+            return 0.0
+        velocity = self.ego_vehicle.get_velocity()
+        speed_xy = math.hypot(velocity.x, velocity.y)
+        if speed_xy > self.stopped_speed_threshold:
+            dir_x = velocity.x / speed_xy
+            dir_y = velocity.y / speed_xy
         else:
-            # 制动：brake = -acc/max_brake，归一化到[0,1]
-            throttle = 0.0
-            brake = float(np.clip(-acc_cmd / max_brake, 0.0, 1.0))
-            reverse = False
-        
-        return throttle, steer_norm, brake, reverse
-    
-    def step(self, action):
+            yaw = math.radians(self.ego_vehicle.get_transform().rotation.yaw)
+            dir_x = math.cos(yaw)
+            dir_y = math.sin(yaw)
+        acceleration = self.ego_vehicle.get_acceleration()
+        return acceleration.x * dir_x + acceleration.y * dir_y
+
+    def _longitudinal_feedback_state(self):
+        speed = self._ego_speed()
+        measured_acc = self.get_ego_longitudinal_acceleration()
+        if not np.isfinite(measured_acc):
+            if self._last_longitudinal_speed is None:
+                measured_acc = 0.0
+            else:
+                measured_acc = (speed - self._last_longitudinal_speed) / max(self.dt, 1e-6)
+        self._last_longitudinal_speed = speed
+
+        alpha = float(np.clip(self.longitudinal_accel_filter_alpha, 0.0, 1.0))
+        self._filtered_longitudinal_accel = (
+            alpha * measured_acc + (1.0 - alpha) * self._filtered_longitudinal_accel
+        )
+        return speed, self._filtered_longitudinal_accel
+
+    def spawn_pedestrian(self, location, speed=1.0, target_location=None, yaw=0.0):
+        walker_bp = self.world.get_blueprint_library().filter("walker.pedestrian.*")[0]
+        walker_bp.set_attribute("speed", str(speed))
+
+        spawn_z = float(location[2]) if len(location) > 2 else 1.0
+        transform = carla.Transform(
+            carla.Location(x=float(location[0]), y=float(location[1]), z=spawn_z),
+            carla.Rotation(yaw=float(yaw)),
+        )
+
+        walker = self.world.spawn_actor(walker_bp, transform)
+
+        controller_bp = self.world.get_blueprint_library().find("controller.ai.walker")
+        controller = self.world.spawn_actor(controller_bp, carla.Transform(), attach_to=walker)
+
+        controller.start()
+        if target_location is None:
+            target = carla.Location(
+                x=location[0] + random.uniform(-5, 5),
+                y=location[1] + random.uniform(-5, 5),
+                z=0,
+            )
+        else:
+            target_z = float(target_location[2]) if len(target_location) > 2 else 0.0
+            target = carla.Location(
+                x=float(target_location[0]),
+                y=float(target_location[1]),
+                z=target_z,
+            )
+
+        controller.go_to_location(target)
+        controller.set_max_speed(speed)
+
+        self.pedestrians.append(walker)
+        self.pedestrian_controllers.append(controller)
+        return walker, controller
+
+    def spawn_scripted_pedestrian(self, transform, speed=1.0, max_retries=5):
+        walker_bp = self.world.get_blueprint_library().filter("walker.pedestrian.*")[0]
+        if walker_bp.has_attribute("speed"):
+            walker_bp.set_attribute("speed", str(speed))
+
+        for attempt in range(max_retries):
+            loc = carla.Location(
+                x=transform.location.x,
+                y=transform.location.y,
+                z=transform.location.z + 0.2 * attempt,
+            )
+            candidate = carla.Transform(loc, transform.rotation)
+            try:
+                walker = self.world.try_spawn_actor(walker_bp, candidate)
+                if walker is None:
+                    continue
+                walker.set_simulate_physics(False)
+                self.pedestrians.append(walker)
+                self.world.tick()
+                return walker
+            except RuntimeError:
+                continue
+
+        return None
+
+    def spawn_pedestrians_on_path(
+        self, path_points, num_pedestrians=3, radius=3.0, speed_range=(0.5, 1.5)
+    ):
+        spawned = []
+
+        for _ in range(num_pedestrians):
+            path_idx = random.randint(5, len(path_points) - 10)
+            base_x, base_y = path_points[path_idx]
+
+            x = base_x + random.uniform(-radius, radius)
+            y = base_y + random.uniform(-radius, radius)
+            speed = random.uniform(*speed_range)
+
+            walker, controller = self.spawn_pedestrian([x, y], speed)
+            spawned.append(
+                {
+                    "walker": walker,
+                    "controller": controller,
+                    "spawn_path_idx": path_idx,
+                    "base_x": base_x,
+                    "base_y": base_y,
+                }
+            )
+
+        return spawned
+
+    def get_pedestrian_states(self):
+        states = []
+        for ped in self.pedestrians:
+            try:
+                transform = ped.get_transform()
+                velocity = ped.get_velocity()
+                scripted_velocity = self.scripted_actor_velocities.get(ped.id)
+                if scripted_velocity is not None:
+                    velocity = carla.Vector3D(
+                        x=float(scripted_velocity[0]),
+                        y=float(scripted_velocity[1]),
+                        z=0.0,
+                    )
+                states.append(
+                    [
+                        transform.location.x,
+                        transform.location.y,
+                        velocity.x,
+                        velocity.y,
+                    ]
+                )
+            except Exception:
+                pass
+        return states
+
+    def get_obstacle_states(
+        self,
+        max_distance=28.0,
+        include_walkers=True,
+        front_only=True,
+        lateral_limit=12.0,
+        rear_release_distance=30.0,
+    ):
+        """Return nearby obstacle states.
+
+        Each row is [x, y, vx, vy, radius, half_length, yaw_rad, is_vehicle, pass_lateral].
         """
-        执行一步仿真（标准化的环境step接口）
-        
-        流程：
-            1. 转换控制指令
-            2. 发送到CARLA执行
-            3. 推进仿真一帧
-        
-        参数：
-            action: [acc, steer] MPC控制输出
+        states = []
+        if self.ego_vehicle is None:
+            return states
+
+        ego_transform = self.ego_vehicle.get_transform()
+        ego_loc = self.ego_vehicle.get_location()
+        ego_yaw = math.radians(ego_transform.rotation.yaw)
+
+        def is_relevant(location):
+            dx = location.x - ego_loc.x
+            dy = location.y - ego_loc.y
+            rel_x = dx * math.cos(ego_yaw) + dy * math.sin(ego_yaw)
+            rel_y = -dx * math.sin(ego_yaw) + dy * math.cos(ego_yaw)
+            if front_only and rel_x < -rear_release_distance:
+                return False
+            if abs(rel_y) > lateral_limit:
+                return False
+            return True
+
+        def angle_diff_rad(a, b):
+            return math.atan2(math.sin(a - b), math.cos(a - b))
+
+        def is_same_direction(source_wp, target_wp):
+            if target_wp is None or target_wp.lane_type != carla.LaneType.Driving:
+                return False
+            source_yaw = math.radians(source_wp.transform.rotation.yaw)
+            target_yaw = math.radians(target_wp.transform.rotation.yaw)
+            return abs(angle_diff_rad(target_yaw, source_yaw)) < math.pi / 2.0
+
+        def marking_allows(marking, direction):
+            if marking is None:
+                return False
+            return bool(marking.lane_change & direction)
+
+        def legal_pass_lateral_for_actor(actor):
+            loc = actor.get_location()
+            waypoint = self.map.get_waypoint(
+                loc,
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving,
+            )
+            if waypoint is None:
+                return 0.0
+
+            yaw_rad = math.radians(waypoint.transform.rotation.yaw)
+            left_axis = (-math.sin(yaw_rad), math.cos(yaw_rad))
+            source_loc = waypoint.transform.location
+
+            def signed_lateral_to(target_wp):
+                target_loc = target_wp.transform.location
+                dx = target_loc.x - source_loc.x
+                dy = target_loc.y - source_loc.y
+                return dx * left_axis[0] + dy * left_axis[1]
+
+            right_lane = waypoint.get_right_lane()
+            if (
+                marking_allows(waypoint.right_lane_marking, carla.LaneChange.Right)
+                and is_same_direction(waypoint, right_lane)
+            ):
+                return signed_lateral_to(right_lane)
+
+            left_lane = waypoint.get_left_lane()
+            if (
+                marking_allows(waypoint.left_lane_marking, carla.LaneChange.Left)
+                and is_same_direction(waypoint, left_lane)
+            ):
+                return signed_lateral_to(left_lane)
+
+            return 0.0
+
+        for vehicle in self.world.get_actors().filter("vehicle.*"):
+            if vehicle.id == self.ego_vehicle.id:
+                continue
+            try:
+                loc = vehicle.get_location()
+                if ego_loc.distance(loc) > max_distance:
+                    continue
+                if not is_relevant(loc):
+                    continue
+                vel = vehicle.get_velocity()
+                scripted_velocity = self.scripted_actor_velocities.get(vehicle.id)
+                if scripted_velocity is not None:
+                    vel = carla.Vector3D(
+                        x=float(scripted_velocity[0]),
+                        y=float(scripted_velocity[1]),
+                        z=0.0,
+                    )
+                extent = vehicle.bounding_box.extent
+                # The CILQR state is treated as a point-mass center. Using the
+                # full vehicle half-length as a circular obstacle radius is too
+                # conservative and can make the optimizer orbit the obstacle.
+                radius = max(extent.y, 0.8) + 0.4
+                half_length = max(extent.x, radius)
+                waypoint = self.map.get_waypoint(
+                    loc,
+                    project_to_road=True,
+                    lane_type=carla.LaneType.Driving,
+                )
+                yaw_rad = (
+                    math.radians(waypoint.transform.rotation.yaw)
+                    if waypoint is not None
+                    else math.radians(vehicle.get_transform().rotation.yaw)
+                )
+                pass_lateral = legal_pass_lateral_for_actor(vehicle)
+                states.append([loc.x, loc.y, vel.x, vel.y, radius, half_length, yaw_rad, 1.0, pass_lateral])
+            except Exception:
+                pass
+
+        if include_walkers:
+            for walker in self.world.get_actors().filter("walker.*"):
+                try:
+                    loc = walker.get_location()
+                    if ego_loc.distance(loc) > max_distance:
+                        continue
+                    if not is_relevant(loc):
+                        continue
+                    vel = walker.get_velocity()
+                    scripted_velocity = self.scripted_actor_velocities.get(walker.id)
+                    if scripted_velocity is not None:
+                        vel = carla.Vector3D(
+                            x=float(scripted_velocity[0]),
+                            y=float(scripted_velocity[1]),
+                            z=0.0,
+                        )
+                    extent = walker.bounding_box.extent
+                    radius = max(extent.x, extent.y, 0.4) + 0.6
+                    yaw_rad = math.radians(walker.get_transform().rotation.yaw)
+                    states.append([loc.x, loc.y, vel.x, vel.y, radius, radius, yaw_rad, 0.0, 0.0])
+                except Exception:
+                    pass
+
+        return states
+
+    def spawn_obstacle_vehicle(self, transform, blueprint=None, max_retries=5):
+        """Spawn a static obstacle vehicle for CILQR avoidance tests.
+
+        Comment out the call site in test_main.py or set
+        spawn_static_obstacle_demo = False to disable the test obstacle without
+        affecting normal simulation.
         """
-        # 转换控制指令
-        throttle, steer_norm, brake, reverse = self.get_cmd(action)
-        
-        # 发送控制指令到CARLA
-        self.ego_vehicle.apply_control(carla.VehicleControl(
-            throttle=throttle,
-            steer=steer_norm,
-            brake=brake,
-            reverse=reverse
-        ))
-        
-        # 推进仿真（同步模式下会等待dt秒）
+        if blueprint is None:
+            blueprints = self.world.get_blueprint_library().filter("vehicle.*")
+            blueprint = blueprints[0]
+
+        for attempt in range(max_retries):
+            loc = carla.Location(
+                x=transform.location.x,
+                y=transform.location.y,
+                z=transform.location.z + 0.25 * attempt,
+            )
+            candidate = carla.Transform(loc, transform.rotation)
+            try:
+                obstacle = self.world.try_spawn_actor(blueprint, candidate)
+                if obstacle is None:
+                    continue
+                obstacle.set_simulate_physics(False)
+                self.obstacle_vehicles.append(obstacle)
+                self.world.tick()
+                return obstacle
+            except RuntimeError:
+                continue
+
+        return None
+
+    def set_scripted_actor_velocity(self, actor, velocity):
+        self.scripted_actor_velocities[actor.id] = (
+            float(velocity[0]),
+            float(velocity[1]),
+        )
+
+    def destroy_obstacle_vehicles(self):
+        """Destroy only the test obstacles spawned by spawn_obstacle_vehicle."""
+        for obstacle in list(self.obstacle_vehicles):
+            try:
+                self.scripted_actor_velocities.pop(obstacle.id, None)
+                obstacle.destroy()
+            except Exception:
+                pass
+        self.obstacle_vehicles = []
+
+    def update_pedestrians_random(self):
+        for controller in self.pedestrian_controllers:
+            try:
+                if random.random() < 0.02:
+                    if self.last_vehicle_pos is not None:
+                        vx, vy = self.last_vehicle_pos
+                        target_x = vx + random.uniform(-20, 20)
+                        target_y = vy + random.uniform(-20, 20)
+                    else:
+                        target_x = random.uniform(-50, 50)
+                        target_y = random.uniform(-50, 50)
+
+                    controller.go_to_location(carla.Location(x=target_x, y=target_y, z=0))
+            except Exception:
+                pass
+
+    def set_vehicle_pos_for_pedestrians(self, x, y):
+        self.last_vehicle_pos = (x, y)
+
+    def clean(self):
+        actors = self.world.get_actors()
+
+        for controller in list(actors.filter("controller.*")):
+            try:
+                controller.stop()
+                controller.destroy()
+            except Exception:
+                pass
+
+        for pattern in ("sensor.*", "vehicle.*", "walker.*"):
+            for actor in list(actors.filter(pattern)):
+                try:
+                    actor.destroy()
+                except Exception:
+                    pass
+
+        for _ in range(3):
+            try:
+                self.world.tick()
+            except Exception:
+                break
+
+        self.ego_vehicle = None
+        self.pedestrians = []
+        self.pedestrian_controllers = []
+        self.obstacle_vehicles = []
+        self.scripted_actor_velocities = {}
+        self._reset_longitudinal_controller()
+
+    def reset(self, spawn_point=None):
+        if spawn_point is None:
+            spawn_points = self.map.get_spawn_points()
+            spawn_point = spawn_points[0]
+
+        if self.ego_vehicle is not None:
+            try:
+                self.ego_vehicle.destroy()
+                self.world.tick()
+            except Exception:
+                pass
+
+        blueprints = self.world.get_blueprint_library().filter("vehicle.tesla.model3")
+        if not blueprints:
+            blueprints = self.world.get_blueprint_library().filter("vehicle.*")
+
+        blueprint = blueprints[0]
+        if blueprint.has_attribute("role_name"):
+            blueprint.set_attribute("role_name", "hero")
+
+        self.ego_vehicle = self.world.try_spawn_actor(blueprint, spawn_point)
+        if self.ego_vehicle is None:
+            raise RuntimeError(
+                "Failed to spawn ego vehicle. The selected spawn point may be occupied."
+            )
+
+        self.ego_vehicle.set_simulate_physics(True)
+        self.ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+
+        if self.display_method == "spec" and not self.no_rendering:
+            self._update_spectator()
+
+        for _ in range(10):
+            self.world.tick()
+
+        self._reset_longitudinal_controller()
+        return self.ego_vehicle
+
+    def _update_spectator(self):
+        if self.ego_vehicle and self.spectator:
+            transform = self.ego_vehicle.get_transform()
+            camera_location = carla.Location(
+                x=transform.location.x,
+                y=transform.location.y,
+                z=40.0,
+            )
+            camera_rotation = carla.Rotation(pitch=-90, yaw=0, roll=0)
+            self.spectator.set_transform(carla.Transform(camera_location, camera_rotation))
+
+    def step(self, control):
+        if len(control) >= 2:
+            acc, steer = control[0], control[1]
+            speed, measured_acc = self._longitudinal_feedback_state()
+
+            if acc >= -0.05:
+                acc_error = float(acc) - measured_acc
+                self._accel_error_integral = float(
+                    np.clip(
+                        self._accel_error_integral + acc_error * self.dt,
+                        -self.accel_integral_limit,
+                        self.accel_integral_limit,
+                    )
+                )
+                throttle = max(float(acc), 0.0) / self.throttle_acc_scale
+                throttle += self.accel_feedback_kp * acc_error
+                throttle += self.accel_feedback_ki * self._accel_error_integral
+                if acc > 0.05 and speed < self.launch_speed_threshold:
+                    launch_ratio = 1.0 - speed / max(self.launch_speed_threshold, 1e-6)
+                    throttle = max(throttle, self.launch_min_throttle * launch_ratio)
+                if speed < self.launch_release_speed:
+                    release_ratio = speed / max(self.launch_release_speed, 1e-6)
+                    launch_cap = self.launch_max_throttle + (
+                        self.max_throttle - self.launch_max_throttle
+                    ) * float(np.clip(release_ratio, 0.0, 1.0))
+                    throttle = min(throttle, launch_cap)
+                throttle = float(np.clip(throttle, 0.0, self.max_throttle))
+                brake = 0.0
+            else:
+                self._accel_error_integral = 0.0
+                throttle = 0.0
+                desired_decel = min(-float(acc), self.max_longitudinal_decel)
+                measured_decel = max(-measured_acc, 0.0)
+                brake = desired_decel / self.brake_acc_scale
+                brake += self.brake_accel_feedback_kp * (desired_decel - measured_decel)
+                brake = float(np.clip(brake, 0.0, self.max_brake))
+
+            steer = float(np.clip(steer, -self.max_steer_rad, self.max_steer_rad))
+            carla_steer = float(np.clip(steer / self.max_steer_rad, -1.0, 1.0))
+
+            vehicle_control = carla.VehicleControl()
+            vehicle_control.throttle = throttle
+            vehicle_control.brake = brake
+            vehicle_control.steer = carla_steer
+            vehicle_control.hand_brake = False
+            vehicle_control.reverse = False
+            vehicle_control.manual_gear_shift = False
+            self.last_vehicle_control = vehicle_control
+            self.ego_vehicle.apply_control(vehicle_control)
+
+        if self.display_method == "spec" and not self.no_rendering:
+            self._update_spectator()
+
         self.world.tick()
-        
-        # 更新相机视角（跟随车辆）
-        if self.display_method == "spec":
-            # spec模式：鸟瞰视角，相机位于车辆正上方30米
-            transform = self.ego_vehicle.get_transform()
-            self.spectator.set_transform(carla.Transform(
-                transform.location + carla.Location(z=30),
-                carla.Rotation(pitch=-90)  # 俯视
-            ))
-        elif self.display_method == "pygame" and pygame is not None:
-            # pygame模式：使用摄像头的视角
-            transform = self.ego_vehicle.get_transform()
-    
+
+        return self.last_vehicle_control
+
+    def init_display(self):
+        pygame.init()
+        pygame.font.init()
+
+        width, height = 1280, 720
+        self.display = pygame.display.set_mode((width, height))
+        pygame.display.set_caption("CILQR Controller")
+
+        self.clock = pygame.time.Clock()
+        self.hud = HUD(width, height)
+
     def check_quit(self):
-        """
-        检查是否按下退出键（pygame模式）
-        
-        在pygame窗口中检测QUIT事件（点击X按钮或Alt+F4）
-        """
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
-                exit()
-    
-    def clean(self):
-        """
-        清理环境（析构函数，程序退出时自动调用）
-        
-        恢复原始世界设置，销毁所有生成的Actor（车辆）
-        防止CARLA服务器残留状态影响下次运行
-        """
-        # 恢复原始世界设置
-        self.world.apply_settings(self.original_settings)
-        
-        # 批量销毁所有Actor（车辆、传感器等）
-        self.client.apply_batch([
-            carla.command.DestroyActor(x) for x in self.actor_list
-        ])
-
-    def spawn_obstacle_vehicle(self, spawn_point, blueprint=None, max_retries=5):
-        """
-        在指定位置生成一辆静止障碍车辆（带碰撞检测重试）
-        
-        参数：
-            spawn_point: carla.Transform，车辆生成位置
-            blueprint: 车辆蓝图，None则随机选择
-            max_retries: 最大重试次数
-        
-        返回：
-            生成的车辆actor，或 None（生成失败）
-        """
-        if blueprint is None:
-            blueprint = self.world.get_blueprint_library().filter('vehicle.*')[0]
-        
-        # 尝试多次，找到无碰撞的位置
-        for attempt in range(max_retries):
-            try:
-                # 尝试向上偏移0.5m，避免地面碰撞
-                adjusted_loc = carla.Location(
-                    x=spawn_point.location.x,
-                    y=spawn_point.location.y,
-                    z=spawn_point.location.z + 0.5 * attempt
-                )
-                adjusted_transform = carla.Transform(
-                    location=adjusted_loc,
-                    rotation=spawn_point.rotation
-                )
-                obstacle = self.world.spawn_actor(blueprint, adjusted_transform)
-                obstacle.set_simulate_physics(False)  # 静止不动
-                self.actor_list.append(obstacle)
-                return obstacle
-            except RuntimeError:
-                # 碰撞了，尝试下一个位置
-                continue
-        
-        print(f"[WARN] Failed to spawn obstacle after {max_retries} attempts")
-        return None
+                return True
+        return False
 
 
 class HUD:
-    """
-    Heads-Up Display（平视显示系统）
-    
-    在pygame窗口上叠加显示车辆状态信息：
-        - FPS（服务器和客户端）
-        - 当前速度（km/h）
-        - 当前位置（x, y）
-        - 控制输入（油门、刹车、转向）
-        - 附近车辆信息
-    
-    视觉上类似赛车游戏的仪表盘
-    """
-    
     def __init__(self, width, height):
-        """
-        初始化HUD
-        
-        参数：
-            width: 显示区域宽度（像素）
-            height: 显示区域高度（像素）
-        """
-        self.dim = (width, height)
-        
-        # 设置等宽字体（用于数值显示）
-        font = pygame.font.Font(pygame.font.get_default_font(), 20)
-        font_name = 'courier' if os.name == 'nt' else 'mono'
-        fonts = [x for x in pygame.font.get_fonts() if font_name in x]
-        default_font = 'ubuntumono'
-        mono = default_font if default_font in fonts else fonts[0]
-        mono = pygame.font.match_font(mono)
-        self._font_mono = pygame.font.Font(mono, 12 if os.name == 'nt' else 14)
-        
-        # 状态变量
-        self.server_fps = 0
-        self.frame = 0
+        self.width = width
+        self.height = height
+        self.font = pygame.font.Font(pygame.font.get_default_font(), 20)
+
         self.simulation_time = 0
-        self._info_text = []       # 要显示的文本行
-        self._show_info = True    # 是否显示信息
-        self._server_clock = pygame.time.Clock()  # 服务器时钟
-    
-    def on_world_tick(self, timestamp):
-        """
-        CARLA世界Tick回调（每次仿真推进时调用）
-        
-        更新FPS等时间相关信息
-        
-        参数：
-            timestamp: CARLA时间戳对象
-        """
-        self._server_clock.tick()
-        self.server_fps = self._server_clock.get_fps()
-        self.frame = timestamp.frame
-        self.simulation_time = timestamp.elapsed_seconds
-    
+        self.vehicle_speed = 0
+        self.control_throttle = 0
+        self.control_steer = 0
+        self.control_brake = 0
+
     def tick(self, env, clock):
-        """
-        更新HUD显示内容（每帧调用）
-        
-        从车辆获取最新状态，构建要显示的文本列表
-        
-        参数：
-            env: Env环境对象
-            clock: pygame时钟对象
-        """
-        if not self._show_info:
-            return
-        
-        # 获取车辆状态
-        t = env.ego_vehicle.get_transform()      # 位置和朝向
-        v = env.ego_vehicle.get_velocity()       # 速度向量
-        c = env.ego_vehicle.get_control()        # 当前控制输入
-        
-        # 获取附近车辆列表
-        vehicles = env.world.get_actors().filter('vehicle.*')
-        
-        # -------------------------------------------
-        # 构建显示文本（第一部分：基本信息）
-        # -------------------------------------------
-        self._info_text = [
-            'Server:  % 16.0f FPS' % self.server_fps,
-            'Client:  % 16.0f FPS' % clock.get_fps(),
-            '',
-            'Vehicle: % 20s' % get_actor_display_name(env.ego_vehicle, truncate=20),
-            'Map:     % 20s' % env.map.name.split('/')[-1],
-            'Simulation time: % 12s' % datetime.timedelta(seconds=int(self.simulation_time)),
-            '',
-            'Speed:   % 15.0f km/h' % (3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)),
-        ]
-        
-        # 添加位置信息
-        self._info_text += [
-            'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (t.location.x, t.location.y)),
-        ]
-        
-        # -------------------------------------------
-        # 添加控制信息（如果有）
-        # -------------------------------------------
-        if isinstance(c, carla.VehicleControl):
-            self._info_text += [
-                ('Throttle:', c.throttle, 0.0, 1.0),   # 元组会被渲染为进度条
-                ('Steer:', c.steer, -1.0, 1.0),
-                ('Brake:', c.brake, 0.0, 1.0),
-                ('Reverse:', c.reverse),                # 布尔值渲染为方块
-                ('Hand brake:', c.hand_brake),
-            ]
-        
-        # -------------------------------------------
-        # 添加附近车辆信息
-        # -------------------------------------------
-        if len(vehicles) > 1:
-            self._info_text += ['Nearby vehicles:']
-            # 计算距离
-            distance = lambda l: math.sqrt(
-                (l.x - t.location.x)**2 + 
-                (l.y - t.location.y)**2 + 
-                (l.z - t.location.z)**2
-            )
-            # 按距离排序
-            vehicles = [(distance(x.get_location()), x) 
-                       for x in vehicles if x.id != env.ego_vehicle.id]
-            for d, vehicle in sorted(vehicles, key=lambda vehicles: vehicles[0]):
-                if d > 200.0:  # 只显示200米内的车辆
-                    break
-                vehicle_type = get_actor_display_name(vehicle, truncate=22)
-                self._info_text.append('% 4dm %s' % (d, vehicle_type))
-    
-    def toggle_info(self):
-        """切换信息显示/隐藏"""
-        self._show_info = not self._show_info
-    
+        self.simulation_time += env.dt
+
+        vel = env.ego_vehicle.get_velocity()
+        self.vehicle_speed = 3.6 * math.sqrt(vel.x**2 + vel.y**2)
+
+        control = env.ego_vehicle.get_control()
+        self.control_throttle = control.throttle
+        self.control_brake = control.brake
+        self.control_steer = control.steer
+
     def render(self, display):
-        """
-        渲染HUD到pygame显示表面
-        
-        参数：
-            display: pygame.Surface对象
-        """
-        if self._show_info:
-            # 创建半透明信息面板
-            if not hasattr(self, 'info_surface'):
-                self.info_surface = pygame.Surface((220, self.dim[1]))
-                self.info_surface.set_alpha(40)  # 40/255 透明度
-                display.blit(self.info_surface, (0, 0))
-            
-            # 渲染文本
-            v_offset = 4      # 垂直偏移
-            bar_h_offset = 100  # 进度条水平起始位置
-            bar_width = 106    # 进度条宽度
-            
-            for item in self._info_text:
-                # 检查是否超出显示区域
-                if v_offset + 18 > self.dim[1]:
-                    break
-                
-                # 处理进度条类型的数据
-                if isinstance(item, list):
-                    if len(item) > 1:
-                        # 绘制进度条
-                        points = [(x + 8, v_offset + 8 + (1.0 - y) * 30) 
-                                  for x, y in enumerate(item)]
-                        pygame.draw.lines(display, (255, 136, 0), False, points, 2)
-                    item = None
-                    v_offset += 18
-                elif isinstance(item, tuple):
-                    # 根据数据类型绘制不同样式
-                    if isinstance(item[1], bool):
-                        # 布尔值：绘制方块
-                        rect = pygame.Rect((bar_h_offset, v_offset + 8), (6, 6))
-                        pygame.draw.rect(
-                            display, 
-                            (255, 255, 255), 
-                            rect, 
-                            0 if item[1] else 1
-                        )
-                    else:
-                        # 数值：绘制进度条
-                        rect_border = pygame.Rect(
-                            (bar_h_offset, v_offset + 8), 
-                            (bar_width, 6)
-                        )
-                        pygame.draw.rect(display, (255, 255, 255), rect_border, 1)
-                        
-                        # 计算填充比例
-                        f = (item[1] - item[2]) / (item[3] - item[2])
-                        if item[2] < 0.0:
-                            # 负数进度条从中间开始
-                            rect = pygame.Rect(
-                                (bar_h_offset + f * (bar_width - 6), v_offset + 8), 
-                                (6, 6)
-                            )
-                        else:
-                            rect = pygame.Rect(
-                                (bar_h_offset, v_offset + 8), 
-                                (f * bar_width, 6)
-                            )
-                        pygame.draw.rect(display, (255, 255, 255), rect)
-                    item = item[0]  # 保留标签名
-                
-                # 绘制文本
-                if item:
-                    surface = self._font_mono.render(item, True, (255, 255, 255))
-                    display.blit(surface, (8, v_offset))
-                v_offset += 18
+        display.fill((0, 0, 0))
+
+        v_info = self.font.render(
+            f"Speed: {self.vehicle_speed:.1f} km/h", True, (255, 255, 255)
+        )
+        display.blit(v_info, (10, 10))
+
+        c_info = self.font.render(
+            (
+                f"Throttle: {self.control_throttle:.2f}  "
+                f"Brake: {self.control_brake:.2f}  "
+                f"Steer: {self.control_steer:.2f}"
+            ),
+            True,
+            (255, 255, 255),
+        )
+        display.blit(c_info, (10, 40))
+
+        t_info = self.font.render(f"Time: {self.simulation_time:.1f}s", True, (255, 255, 255))
+        display.blit(t_info, (10, 70))
 
 
-def get_actor_display_name(actor, truncate=250):
-    """
-    获取Actor的显示名称（格式化类型ID）
-    
-    将CARLA的type_id（如"vehicle.tesla.model3"）
-    转换为可读名称（如"Tesla Model3"）
-    
-    参数：
-        actor: CARLA Actor对象
-        truncate: 最大字符长度
-    
-    返回：
-        格式化后的车辆名称
-    """
-    name = ' '.join(
-        actor.type_id.replace('_', '.').title().split('.')[1:]
-    )
-    return (name[:truncate - 1] + '…') if len(name) > truncate else name
+def draw_waypoints(
+    world,
+    waypoints,
+    z=0.5,
+    color=(255, 0, 0),
+    life_time=0.5,
+    draw_lines=False,
+    persistent_lines=True,
+):
+    debug_color = carla.Color(r=color[0], g=color[1], b=color[2], a=255)
+    last_point = None
+    for waypoint in waypoints:
+        transform = waypoint.transform
+        begin = transform.location + carla.Location(z=z)
+        world.debug.draw_point(
+            begin,
+            size=0.1,
+            color=debug_color,
+            life_time=life_time,
+            persistent_lines=persistent_lines,
+        )
+        if draw_lines and last_point is not None:
+            world.debug.draw_line(
+                last_point,
+                begin,
+                thickness=0.08,
+                color=debug_color,
+                life_time=life_time,
+                persistent_lines=persistent_lines,
+            )
+        last_point = begin

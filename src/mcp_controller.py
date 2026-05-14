@@ -19,11 +19,17 @@ mcp_controller.py - MPC模型预测控制器
 
 import carla
 import math
+import os
 import time
 import copy
 import numpy as np
 import casadi as ca
 from scipy.optimize import minimize
+
+try:
+    from .project_paths import ensure_debug_log_dir
+except ImportError:
+    from project_paths import ensure_debug_log_dir
 
 # ============================================
 # 车辆动力学参数（通过系统辨识得到）
@@ -107,11 +113,112 @@ class Vehicle:
         self.steer_bound = 0.7
         
         # 加速度约束（m/s²）
-        self.acc_lbound = -6.0  # 最小加速度（制动）
-        self.acc_ubound = 3.0   # 最大加速度（加速）
+        self.acc_lbound = -5.0  # 最小加速度（制动）
+        self.acc_ubound = 10.0  # 最大加速度（加速）
         
         # 目标速度（m/s），由km/h转换
         self.target_v = target_v / 3.6
+
+        if self.carla and actor is not None:
+            ego_extent = actor.bounding_box.extent
+            self.ego_footprint_radius = max(float(ego_extent.y) + 0.2, 1.0)
+            self.ego_footprint_half_length = max(float(ego_extent.x), 1.5)
+        else:
+            self.ego_footprint_radius = 1.0
+            self.ego_footprint_half_length = 2.4
+        self.obstacle_min_radius = 0.8
+        self.obstacle_longitudinal_min_half = 2.2
+        self.obstacle_influence_dist = 2.0
+        self.obstacle_safe_dist = 0.65
+        self.obstacle_cost_weight = 20.0
+        self.obstacle_violation_weight = 850.0
+        self.obstacle_side_cost_weight = 0.0
+        self.obstacle_side_clearance = 3.2
+        self.obstacle_bypass_start_distance = 10.0
+        self.obstacle_bypass_full_distance = 1.5
+        self.obstacle_return_front_clearance_lengths = 0.5
+        self.obstacle_return_distance = 7.0
+        self.obstacle_cluster_gap = 36.0
+        self.obstacle_cluster_yaw_tolerance = 0.7
+        self.obstacle_cluster_lateral_tolerance = 6.0
+        self.obstacle_static_speed_threshold = 0.5
+        self.obstacle_parallel_yaw_weight = 0.0
+        self.obstacle_yaw_release_distance = 2.0
+        self.lane_boundary_margin = 0.20
+        self.lane_boundary_weight = 900.0
+        self.lane_bound_inactive = 1.0e6
+        # The imported CILQR narrow-corridor scenario spawns 12 static vehicles.
+        # Keep the default MPC parameter slots large enough to cover that layout
+        # without requiring per-run environment overrides.
+        self.max_obstacles = int(os.environ.get("MPC_MAX_OBSTACLES", "16"))
+        self.max_bypass_clusters = int(os.environ.get("MPC_MAX_BYPASS_CLUSTERS", "12"))
+        self.obstacle_param_dim = 10
+        self.bypass_cluster_param_dim = 7
+        self.lane_bound_param_dim = 2
+        self.dynamic_lane_guard_weight = float(
+            os.environ.get("MPC_DYNAMIC_LANE_GUARD_WEIGHT", "140.0")
+        )
+        self.dynamic_lane_guard_hold_margin = float(
+            os.environ.get("MPC_DYNAMIC_LANE_GUARD_HOLD_MARGIN", "0.45")
+        )
+        self.dynamic_lane_guard_same_lane_tolerance = float(
+            os.environ.get("MPC_DYNAMIC_LANE_GUARD_SAME_LANE_TOL", "1.75")
+        )
+        self.dynamic_lane_guard_target_lane_tolerance = float(
+            os.environ.get("MPC_DYNAMIC_LANE_GUARD_TARGET_LANE_TOL", "1.6")
+        )
+        self.dynamic_lane_guard_front_gap = float(
+            os.environ.get("MPC_DYNAMIC_LANE_GUARD_FRONT_GAP", "14.0")
+        )
+        self.dynamic_lane_guard_rear_gap = float(
+            os.environ.get("MPC_DYNAMIC_LANE_GUARD_REAR_GAP", "6.0")
+        )
+        self.dynamic_lane_guard_entry_start_distance = float(
+            os.environ.get("MPC_DYNAMIC_LANE_GUARD_ENTRY_START", "22.0")
+        )
+        self.dynamic_lane_guard_entry_full_distance = float(
+            os.environ.get("MPC_DYNAMIC_LANE_GUARD_ENTRY_FULL", "8.0")
+        )
+        self.dynamic_lane_guard_front_release_distance = float(
+            os.environ.get("MPC_DYNAMIC_LANE_GUARD_FRONT_RELEASE", "2.0")
+        )
+        self.dynamic_lane_guard_release_distance = float(
+            os.environ.get("MPC_DYNAMIC_LANE_GUARD_RELEASE", "8.0")
+        )
+        self.dynamic_overtake_lateral_weight = float(
+            os.environ.get("MPC_DYNAMIC_OVERTAKE_LATERAL_WEIGHT", "26.0")
+        )
+        self.dynamic_obstacle_safe_margin = float(
+            os.environ.get("MPC_DYNAMIC_OBSTACLE_SAFE_MARGIN", "0.0")
+        )
+        self.dynamic_obstacle_influence_margin = float(
+            os.environ.get("MPC_DYNAMIC_OBSTACLE_INFLUENCE_MARGIN", "0.0")
+        )
+        self.dynamic_obstacle_distance_weight_scale = float(
+            os.environ.get("MPC_DYNAMIC_OBSTACLE_DISTANCE_WEIGHT_SCALE", "1.0")
+        )
+        self.dynamic_obstacle_violation_weight_scale = float(
+            os.environ.get("MPC_DYNAMIC_OBSTACLE_VIOLATION_WEIGHT_SCALE", "1.0")
+        )
+        self.previous_acc_cost_weight = 0.5
+        self.previous_steer_cost_weight = 100.0
+        self.steer_delta_bound = float(os.environ.get("MPC_STEER_DELTA_BOUND", "0.12"))
+        self.first_step_steer_delta_bound = float(
+            os.environ.get("MPC_FIRST_STEER_DELTA_BOUND", "0.18")
+        )
+        self.ipopt_max_cpu_time = float(os.environ.get("MPC_IPOPT_MAX_CPU_TIME", "0.08"))
+        self.ipopt_tol = float(os.environ.get("MPC_IPOPT_TOL", "1e-5"))
+        self.ipopt_acceptable_tol = float(os.environ.get("MPC_IPOPT_ACCEPTABLE_TOL", "5e-4"))
+        self.ipopt_acceptable_obj_change_tol = float(
+            os.environ.get("MPC_IPOPT_ACCEPTABLE_OBJ_CHANGE_TOL", "5e-4")
+        )
+        self.solver_initialized = False
+        self.fallback_maxiter = max(
+            self.maxiter,
+            int(os.environ.get("MPC_FALLBACK_MAX_ITER", str(self.maxiter))),
+        )
+        self.solver_fallback = None
+        self.last_min_obstacle_clearance = float("inf")
 
     def get_state_carla(self):
         """
@@ -367,6 +474,25 @@ class Vehicle:
         self.X = ca.SX.sym('X', n_states, self.horizon+1)
         # P: 参考轨迹 (n_states × (horizon+1))
         self.P = ca.SX.sym('P', n_states, self.horizon+1)
+        self.previous_control_param = ca.SX.sym('previous_control', n_controls)
+        self.Obstacles = ca.SX.sym('Obstacles', self.obstacle_param_dim, self.max_obstacles)
+        self.BypassClusters = ca.SX.sym(
+            'BypassClusters',
+            self.bypass_cluster_param_dim,
+            self.max_bypass_clusters,
+        )
+        self.LaneBounds = ca.SX.sym(
+            'LaneBounds',
+            self.lane_bound_param_dim,
+            self.horizon + 1,
+        )
+        self.solver_parameters = ca.vertcat(
+            ca.reshape(self.P, -1, 1),
+            self.previous_control_param,
+            ca.reshape(self.Obstacles, -1, 1),
+            ca.reshape(self.BypassClusters, -1, 1),
+            ca.reshape(self.LaneBounds, -1, 1),
+        )
 
         # 权重矩阵
         self.Q = Q
@@ -516,48 +642,67 @@ class Vehicle:
 
     def solver_add_cost(self):
         """
-        构建MPC优化问题的目标函数和等式约束（动力学约束）
-        
-        目标函数包含三部分：
-            1. 状态跟踪代价：Σ (state_errorᵀ Q state_error)
-            2. 控制代价：Σ (uᵀ R u)
-            3. 控制平滑代价：Σ (Δuᵀ Rd Δu)
-        
-        等式约束：
-            X[:, i+1] = f(X[:, i], U[:, i])  即动力学模型
-        
-        注意：调用此函数前必须先调用 solver_basis()
+        Build the fixed MPC objective and dynamics constraints.
         """
-        self.obj = 0  # 目标函数初始化
-        self.g = []   # 等式约束列表。2项
-        self.lbg = [] # 约束下界
-        self.ubg = [] # 约束上界
-        self.lbx = [] # 变量下界
-        self.ubx = [] # 变量上界
+        self.obj = 0
+        self.g = []
+        self.lbg = []
+        self.ubg = []
+        self.lbx = []
+        self.ubx = []
 
-        # 等式约束  初始状态约束：X[:, 0] = 当前状态P[:, 0]，预测的第0步状态 = 参考的第0步状态，预测必须从当前实际状态出发
+        lane_bound_inactive_threshold = 0.5 * float(self.lane_bound_inactive)
+        lane_boundary_weight = float(self.lane_boundary_weight)
+
+        def lane_boundary_cost(state_slice, ref_slice, lane_bounds_slice):
+            left_bound = lane_bounds_slice[0]
+            right_bound = lane_bounds_slice[1]
+            bounds_active = ca.if_else(
+                ca.fmin(left_bound, right_bound) < lane_bound_inactive_threshold,
+                1.0,
+                0.0,
+            )
+            route_lateral = (
+                (state_slice[0] - ref_slice[0]) * (-ca.sin(ref_slice[2]))
+                + (state_slice[1] - ref_slice[1]) * ca.cos(ref_slice[2])
+            )
+            left_violation = ca.if_else(route_lateral > left_bound, route_lateral - left_bound, 0.0)
+            right_limit = -right_bound
+            right_violation = ca.if_else(route_lateral < right_limit, right_limit - route_lateral, 0.0)
+            return bounds_active * lane_boundary_weight * (left_violation ** 2 + right_violation ** 2)
+
         self.g.append(self.X[:, 0] - self.P[:, 0])
 
-        # 遍历预测时域，构建目标函数和约束
         for i in range(self.horizon):
-            # 状态误差 = 预测状态 - 参考状态
-            state_error = (self.X[0:5, i] - self.P[0:5, i])
-
-            # ---- 目标函数三项 ----
-            # 1. 状态跟踪代价，ca.mtimes矩阵乘法
+            yaw_error = ca.atan2(
+                ca.sin(self.X[2, i] - self.P[2, i]),
+                ca.cos(self.X[2, i] - self.P[2, i]),
+            )
+            state_error = ca.vertcat(
+                self.X[0, i] - self.P[0, i],
+                self.X[1, i] - self.P[1, i],
+                yaw_error,
+                self.X[3, i] - self.P[3, i],
+                self.X[4, i] - self.P[4, i],
+            )
             self.obj = self.obj + ca.mtimes([state_error.T, self.Q, state_error])
-            # 2. 控制代价
             self.obj = self.obj + ca.mtimes([self.U[:, i].T, self.R, self.U[:, i]])
-            # 3. 控制平滑代价（仅在相邻两步之间）control_diff，控制增量
-            if i < (self.horizon-1):
-                control_diff = self.U[:, i] - self.U[:, i+1]
+            if i < (self.horizon - 1):
+                control_diff = self.U[:, i] - self.U[:, i + 1]
                 self.obj = self.obj + ca.mtimes([control_diff.T, self.Rd, control_diff])
-            
-            # ---- 动力学约束 ----
-            # 预测下一步状态
+            self.obj = self.obj + lane_boundary_cost(
+                self.X[:, i],
+                self.P[:, i],
+                self.LaneBounds[:, i],
+            )
             x_next_ = self.f(self.X[:, i], self.U[:, i])
-            # 等式约束：预测状态 = 动力学模型计算状态
-            self.g.append(self.X[:, i+1] - x_next_)
+            self.g.append(self.X[:, i + 1] - x_next_)
+
+        self.obj = self.obj + lane_boundary_cost(
+            self.X[:, self.horizon],
+            self.P[:, self.horizon],
+            self.LaneBounds[:, self.horizon],
+        )
 
     def get_self_centers(self, state_slice, radius=1.5):
         """
@@ -587,22 +732,677 @@ class Vehicle:
         cx2 = obs_x - radius * ca.cos(obs_yaw)
         cy2 = obs_y - radius * ca.sin(obs_yaw)
         return (cx1, cy1), (cx2, cy2)
+
+    def _min_obstacle_clearance(self, x_seq, obstacles):
+        if obstacles is None or len(obstacles) == 0:
+            return float("inf")
+
+        obstacle_rows = np.asarray(obstacles, dtype=float)
+        if obstacle_rows.ndim == 1:
+            obstacle_rows = obstacle_rows.reshape(1, -1)
+
+        state_rows = np.asarray(x_seq, dtype=float)
+        if state_rows.ndim == 1:
+            state_rows = state_rows.reshape(1, -1)
+
+        min_clearance = float("inf")
+        ego_radius = float(self.ego_footprint_radius)
+        ego_half_length = float(self.ego_footprint_half_length)
+
+        for step_index, state in enumerate(state_rows):
+            ego_x = float(state[0])
+            ego_y = float(state[1])
+            ego_yaw = float(state[2])
+            ego_centers = (
+                (
+                    ego_x + ego_half_length * math.cos(ego_yaw),
+                    ego_y + ego_half_length * math.sin(ego_yaw),
+                ),
+                (
+                    ego_x - ego_half_length * math.cos(ego_yaw),
+                    ego_y - ego_half_length * math.sin(ego_yaw),
+                ),
+            )
+            for obstacle in obstacle_rows:
+                if obstacle.shape[0] < 5:
+                    continue
+                obs_vx = float(obstacle[8]) if obstacle.shape[0] > 8 else 0.0
+                obs_vy = float(obstacle[9]) if obstacle.shape[0] > 9 else 0.0
+                obs_x = float(obstacle[0]) + obs_vx * float(step_index) * float(dt)
+                obs_y = float(obstacle[1]) + obs_vy * float(step_index) * float(dt)
+                obs_yaw = float(obstacle[2]) if obstacle.shape[0] > 2 else 0.0
+                obs_radius = max(
+                    float(obstacle[3]) if obstacle.shape[0] > 3 else self.obstacle_min_radius,
+                    float(self.obstacle_min_radius),
+                )
+                obs_half_length = max(
+                    float(obstacle[4]) if obstacle.shape[0] > 4 else self.obstacle_longitudinal_min_half,
+                    float(self.obstacle_longitudinal_min_half),
+                )
+                obs_centers = (
+                    (
+                        obs_x + obs_half_length * math.cos(obs_yaw),
+                        obs_y + obs_half_length * math.sin(obs_yaw),
+                    ),
+                    (
+                        obs_x - obs_half_length * math.cos(obs_yaw),
+                        obs_y - obs_half_length * math.sin(obs_yaw),
+                    ),
+                )
+                for ego_center in ego_centers:
+                    for obs_center in obs_centers:
+                        clearance = (
+                            math.hypot(ego_center[0] - obs_center[0], ego_center[1] - obs_center[1])
+                            - ego_radius
+                            - obs_radius
+                        )
+                        min_clearance = min(min_clearance, clearance)
+        return min_clearance
     
+    def _pack_obstacle_parameters(self, obs):
+        params = np.zeros((self.obstacle_param_dim, self.max_obstacles), dtype=float)
+        if obs is None or len(obs) == 0:
+            return params
+
+        obs = np.asarray(obs, dtype=float)
+        if obs.ndim == 1:
+            obs = obs.reshape(1, -1)
+        if obs.shape[0] > self.max_obstacles:
+            raise ValueError(
+                f"Obstacle count {obs.shape[0]} exceeds MPC_MAX_OBSTACLES={self.max_obstacles}."
+            )
+
+        for index, row in enumerate(obs):
+            params[0, index] = 1.0
+            params[1, index] = float(row[0])
+            params[2, index] = float(row[1])
+            params[3, index] = float(row[2]) if row.shape[0] > 2 else 0.0
+            params[4, index] = max(
+                float(row[3]) if row.shape[0] > 3 else self.obstacle_min_radius,
+                float(self.obstacle_min_radius),
+            )
+            params[5, index] = max(
+                float(row[4]) if row.shape[0] > 4 else self.obstacle_longitudinal_min_half,
+                float(self.obstacle_longitudinal_min_half),
+            )
+            params[6, index] = float(row[8]) if row.shape[0] > 8 else 0.0
+            params[7, index] = float(row[9]) if row.shape[0] > 9 else 0.0
+            params[8, index] = float(row[6]) if row.shape[0] > 6 else 1.0
+            params[9, index] = float(row[7]) if row.shape[0] > 7 else 0.0
+        return params
+
+    def _build_bypass_clusters(self, obs):
+        if obs is None or len(obs) == 0:
+            return []
+
+        obs = np.asarray(obs, dtype=float)
+        if obs.ndim == 1:
+            obs = obs.reshape(1, -1)
+
+        def obstacle_value(row, index, default):
+            return float(row[index]) if row.shape[0] > index else float(default)
+
+        def angle_diff(a, b):
+            return math.atan2(math.sin(a - b), math.cos(a - b))
+
+        candidates = []
+        for row in obs:
+            obs_speed = obstacle_value(row, 5, 0.0)
+            is_vehicle = obstacle_value(row, 6, 1.0)
+            pass_lateral = obstacle_value(row, 7, 0.0)
+            if is_vehicle < 0.5 or obs_speed > self.obstacle_static_speed_threshold:
+                continue
+            candidates.append(
+                {
+                    "x": float(row[0]),
+                    "y": float(row[1]),
+                    "yaw": obstacle_value(row, 2, 0.0),
+                    "half_length": max(
+                        obstacle_value(row, 4, self.obstacle_longitudinal_min_half),
+                        float(self.obstacle_longitudinal_min_half),
+                    ),
+                    "pass_lateral": pass_lateral,
+                }
+            )
+
+        clusters = []
+        for candidate in candidates:
+            merged = False
+            for cluster in clusters:
+                if abs(angle_diff(candidate["yaw"], cluster["yaw"])) > self.obstacle_cluster_yaw_tolerance:
+                    continue
+                if (
+                    abs(candidate["pass_lateral"]) > 1e-6
+                    and abs(cluster["pass_lateral"]) > 1e-6
+                    and candidate["pass_lateral"] * cluster["pass_lateral"] <= 0.0
+                ):
+                    continue
+                forward = cluster["forward"]
+                left = cluster["left"]
+                dx = candidate["x"] - cluster["origin_x"]
+                dy = candidate["y"] - cluster["origin_y"]
+                center_s = dx * forward[0] + dy * forward[1]
+                center_l = dx * left[0] + dy * left[1]
+                rear_s = center_s - candidate["half_length"]
+                front_s = center_s + candidate["half_length"]
+                gap = max(rear_s - cluster["front_s"], cluster["rear_s"] - front_s, 0.0)
+                if abs(center_l) > self.obstacle_cluster_lateral_tolerance or gap > self.obstacle_cluster_gap:
+                    continue
+                cluster["rear_s"] = min(cluster["rear_s"], rear_s)
+                cluster["front_s"] = max(cluster["front_s"], front_s)
+                if abs(candidate["pass_lateral"]) > 1e-6:
+                    if abs(cluster["pass_lateral"]) <= 1e-6:
+                        cluster["pass_lateral"] = candidate["pass_lateral"]
+                    else:
+                        cluster["pass_lateral"] = math.copysign(
+                            max(abs(cluster["pass_lateral"]), abs(candidate["pass_lateral"])),
+                            cluster["pass_lateral"],
+                        )
+                merged = True
+                break
+
+            if not merged:
+                forward = (math.cos(candidate["yaw"]), math.sin(candidate["yaw"]))
+                left = (-math.sin(candidate["yaw"]), math.cos(candidate["yaw"]))
+                clusters.append(
+                    {
+                        "origin_x": candidate["x"],
+                        "origin_y": candidate["y"],
+                        "yaw": candidate["yaw"],
+                        "forward": forward,
+                        "left": left,
+                        "rear_s": -candidate["half_length"],
+                        "front_s": candidate["half_length"],
+                        "pass_lateral": candidate["pass_lateral"],
+                    }
+                )
+        return [cluster for cluster in clusters if abs(cluster["pass_lateral"]) > 1e-6]
+
+    def _pack_bypass_cluster_parameters(self, obs):
+        clusters = self._build_bypass_clusters(obs)
+        if len(clusters) > self.max_bypass_clusters:
+            raise ValueError(
+                f"Bypass cluster count {len(clusters)} exceeds "
+                f"MPC_MAX_BYPASS_CLUSTERS={self.max_bypass_clusters}."
+            )
+
+        params = np.zeros((self.bypass_cluster_param_dim, self.max_bypass_clusters), dtype=float)
+        for index, cluster in enumerate(clusters):
+            params[0, index] = 1.0
+            params[1, index] = float(cluster["origin_x"])
+            params[2, index] = float(cluster["origin_y"])
+            params[3, index] = float(cluster["yaw"])
+            params[4, index] = float(cluster["rear_s"])
+            params[5, index] = float(cluster["front_s"])
+            params[6, index] = float(cluster["pass_lateral"])
+        return params
+
+    def _pack_lane_bound_parameters(self, lane_bounds):
+        params = np.full(
+            (self.lane_bound_param_dim, self.horizon + 1),
+            float(self.lane_bound_inactive),
+            dtype=float,
+        )
+        if lane_bounds is None:
+            return params
+
+        bounds_arr = np.asarray(lane_bounds, dtype=float)
+        if bounds_arr.ndim == 1:
+            if bounds_arr.size != self.lane_bound_param_dim:
+                raise ValueError(
+                    "Lane bounds must contain two values per step: [left_bound, right_bound]."
+                )
+            bounds_arr = np.tile(bounds_arr.reshape(1, -1), (self.horizon + 1, 1))
+        if bounds_arr.shape == (self.lane_bound_param_dim, self.horizon + 1):
+            bounds_arr = bounds_arr.T
+        if bounds_arr.shape[1] != self.lane_bound_param_dim:
+            raise ValueError(
+                "Lane bounds must have shape (horizon+1, 2) or (2, horizon+1)."
+            )
+        if bounds_arr.shape[0] < self.horizon + 1:
+            pad_count = self.horizon + 1 - bounds_arr.shape[0]
+            bounds_arr = np.vstack((bounds_arr, np.repeat(bounds_arr[-1:, :], pad_count, axis=0)))
+        else:
+            bounds_arr = bounds_arr[: self.horizon + 1]
+
+        for column in range(self.lane_bound_param_dim):
+            values = bounds_arr[:, column]
+            values = np.where(np.isfinite(values), values, float(self.lane_bound_inactive))
+            values = np.where(values >= 0.0, values, float(self.lane_bound_inactive))
+            params[column, :] = values
+        return params
+
+    def _runtime_parameters(self, z_ref, z0, previous_control, obstacles, lane_bounds):
+        reference_params = np.vstack((z0.T, z_ref)).T
+        obstacle_params = self._pack_obstacle_parameters(obstacles)
+        cluster_params = self._pack_bypass_cluster_parameters(obstacles)
+        lane_bound_params = self._pack_lane_bound_parameters(lane_bounds)
+        return np.concatenate(
+            (
+                reference_params.reshape(-1, 1, order="F"),
+                np.asarray(previous_control, dtype=float).reshape(-1, 1),
+                obstacle_params.reshape(-1, 1, order="F"),
+                cluster_params.reshape(-1, 1, order="F"),
+                lane_bound_params.reshape(-1, 1, order="F"),
+            ),
+            axis=0,
+        )
+
+    def solver_add_parametric_soft_obs(self):
+        ego_radius = float(self.ego_footprint_radius)
+        ego_half_length = float(self.ego_footprint_half_length)
+        influence_dist = float(self.obstacle_influence_dist)
+        safe_dist = float(self.obstacle_safe_dist)
+        distance_weight = float(self.obstacle_cost_weight)
+        violation_weight = float(self.obstacle_violation_weight)
+        side_weight = float(self.obstacle_side_cost_weight)
+        side_clearance = float(self.obstacle_side_clearance)
+        bypass_start_distance = float(self.obstacle_bypass_start_distance)
+        bypass_full_distance = float(self.obstacle_bypass_full_distance)
+        return_front_clearance_lengths = float(self.obstacle_return_front_clearance_lengths)
+        return_distance = float(self.obstacle_return_distance)
+        yaw_weight = float(self.obstacle_parallel_yaw_weight)
+        yaw_release_distance = float(self.obstacle_yaw_release_distance)
+        dynamic_lane_guard_weight = float(self.dynamic_lane_guard_weight)
+        dynamic_lane_guard_hold_margin = float(self.dynamic_lane_guard_hold_margin)
+        dynamic_lane_guard_same_lane_tolerance = float(
+            self.dynamic_lane_guard_same_lane_tolerance
+        )
+        dynamic_lane_guard_target_lane_tolerance = float(
+            self.dynamic_lane_guard_target_lane_tolerance
+        )
+        dynamic_lane_guard_front_gap = float(self.dynamic_lane_guard_front_gap)
+        dynamic_lane_guard_rear_gap = float(self.dynamic_lane_guard_rear_gap)
+        dynamic_lane_guard_entry_start_distance = float(
+            self.dynamic_lane_guard_entry_start_distance
+        )
+        dynamic_lane_guard_entry_full_distance = float(
+            self.dynamic_lane_guard_entry_full_distance
+        )
+        dynamic_lane_guard_front_release_distance = float(
+            self.dynamic_lane_guard_front_release_distance
+        )
+        dynamic_lane_guard_release_distance = float(
+            self.dynamic_lane_guard_release_distance
+        )
+        dynamic_overtake_lateral_weight = float(
+            self.dynamic_overtake_lateral_weight
+        )
+        dynamic_obstacle_safe_margin = float(self.dynamic_obstacle_safe_margin)
+        dynamic_obstacle_influence_margin = float(self.dynamic_obstacle_influence_margin)
+        dynamic_obstacle_distance_weight_scale = float(
+            self.dynamic_obstacle_distance_weight_scale
+        )
+        dynamic_obstacle_violation_weight_scale = float(
+            self.dynamic_obstacle_violation_weight_scale
+        )
+        dynamic_lane_guard_speed_threshold = float(self.obstacle_static_speed_threshold)
+
+        def smoothstep(value):
+            return value * value * (3.0 - 2.0 * value)
+
+        def bypass_profiles(rel_long, rear_s, front_s):
+            entry_start = rear_s - ego_half_length - bypass_start_distance
+            entry_full = rear_s - ego_half_length - bypass_full_distance
+            return_start = front_s + max((2.0 * return_front_clearance_lengths - 1.0) * ego_half_length, 0.0)
+            return_end = return_start + return_distance
+            yaw_return_start = front_s
+            yaw_return_end = yaw_return_start + yaw_release_distance
+            entry_ratio = (rel_long - entry_start) / max(
+                bypass_start_distance - bypass_full_distance,
+                1e-6,
+            )
+            return_ratio = (rel_long - return_start) / max(return_distance, 1e-6)
+            yaw_return_ratio = (rel_long - yaw_return_start) / max(yaw_release_distance, 1e-6)
+            entry_profile = ca.if_else(
+                rel_long <= entry_start,
+                0.0,
+                ca.if_else(
+                    rel_long < entry_full,
+                    smoothstep(entry_ratio),
+                    ca.if_else(
+                        rel_long <= return_start,
+                        1.0,
+                        ca.if_else(rel_long < return_end, 1.0 - smoothstep(return_ratio), 0.0),
+                    ),
+                ),
+            )
+            yaw_profile = ca.if_else(
+                rel_long <= entry_start,
+                0.0,
+                ca.if_else(
+                    rel_long < entry_full,
+                    smoothstep(entry_ratio),
+                    ca.if_else(
+                        rel_long <= yaw_return_start,
+                        1.0,
+                        ca.if_else(rel_long < yaw_return_end, 1.0 - smoothstep(yaw_return_ratio), 0.0),
+                    ),
+                ),
+            )
+            return entry_profile, yaw_profile
+
+        def dynamic_lane_guard_profile(rel_long, obs_half_length):
+            entry_start = (
+                -obs_half_length
+                - ego_half_length
+                - dynamic_lane_guard_entry_start_distance
+            )
+            entry_full = (
+                -obs_half_length
+                - ego_half_length
+                - dynamic_lane_guard_entry_full_distance
+            )
+            release_start = (
+                obs_half_length
+                + ego_half_length
+                + dynamic_lane_guard_front_release_distance
+            )
+            release_end = release_start + dynamic_lane_guard_release_distance
+            entry_ratio = (rel_long - entry_start) / max(
+                dynamic_lane_guard_entry_start_distance
+                - dynamic_lane_guard_entry_full_distance,
+                1e-6,
+            )
+            release_ratio = (rel_long - release_start) / max(
+                dynamic_lane_guard_release_distance,
+                1e-6,
+            )
+            return ca.if_else(
+                rel_long <= entry_start,
+                0.0,
+                ca.if_else(
+                    rel_long < entry_full,
+                    smoothstep(entry_ratio),
+                    ca.if_else(
+                        rel_long <= release_start,
+                        1.0,
+                        ca.if_else(
+                            rel_long < release_end,
+                            1.0 - smoothstep(release_ratio),
+                            0.0,
+                        ),
+                    ),
+                ),
+            )
+
+        for i in range(self.horizon):
+            state_i = self.X[:, i]
+            ego_centers = self.get_self_centers(state_i, ego_half_length)
+
+            for j in range(self.max_obstacles):
+                active = self.Obstacles[0, j]
+                obs_x0 = self.Obstacles[1, j]
+                obs_y0 = self.Obstacles[2, j]
+                obs_yaw = self.Obstacles[3, j]
+                obs_radius = self.Obstacles[4, j]
+                obs_half_length = self.Obstacles[5, j]
+                obs_vx = self.Obstacles[6, j]
+                obs_vy = self.Obstacles[7, j]
+                obs_is_vehicle = self.Obstacles[8, j]
+                obs_pass_lateral = self.Obstacles[9, j]
+                obs_x = obs_x0 + obs_vx * (i * dt)
+                obs_y = obs_y0 + obs_vy * (i * dt)
+                obs_speed = ca.sqrt(obs_vx ** 2 + obs_vy ** 2 + 1e-6)
+                dynamic_obstacle_factor = ca.if_else(
+                    obs_speed > dynamic_lane_guard_speed_threshold,
+                    1.0,
+                    0.0,
+                )
+                influence_dist_eff = influence_dist + dynamic_obstacle_factor * dynamic_obstacle_influence_margin
+                safe_dist_eff = safe_dist + dynamic_obstacle_factor * dynamic_obstacle_safe_margin
+                distance_weight_eff = distance_weight * (
+                    1.0
+                    + dynamic_obstacle_factor
+                    * max(dynamic_obstacle_distance_weight_scale - 1.0, 0.0)
+                )
+                violation_weight_eff = violation_weight * (
+                    1.0
+                    + dynamic_obstacle_factor
+                    * max(dynamic_obstacle_violation_weight_scale - 1.0, 0.0)
+                )
+                obs_forward_x = ca.cos(obs_yaw)
+                obs_forward_y = ca.sin(obs_yaw)
+                obs_left_x = -obs_forward_y
+                obs_left_y = obs_forward_x
+                obs_centers = self.get_obs_centers_simple(obs_x, obs_y, obs_yaw, obs_half_length)
+
+                for ego_center in ego_centers:
+                    for obs_center in obs_centers:
+                        dist = ca.sqrt(
+                            (ego_center[0] - obs_center[0]) ** 2
+                            + (ego_center[1] - obs_center[1]) ** 2
+                            + 1e-6
+                        )
+                        clearance = dist - ego_radius - obs_radius
+                        distance_cost = ca.if_else(
+                            clearance < influence_dist_eff,
+                            distance_weight_eff * (influence_dist_eff - clearance) ** 2,
+                            0.0,
+                        )
+                        violation_cost = ca.if_else(
+                            clearance < safe_dist_eff,
+                            violation_weight_eff * (safe_dist_eff - clearance) ** 2,
+                            0.0,
+                        )
+                        self.obj += active * (distance_cost + violation_cost) / (i + 1)
+
+                ego_obs_dx = state_i[0] - obs_x
+                ego_obs_dy = state_i[1] - obs_y
+                ego_obs_long = (
+                    ego_obs_dx * obs_forward_x + ego_obs_dy * obs_forward_y
+                )
+                ego_obs_lateral = (
+                    ego_obs_dx * obs_left_x + ego_obs_dy * obs_left_y
+                )
+                same_lane_ratio = ca.fmax(
+                    0.0,
+                    1.0 - ca.fabs(ego_obs_lateral)
+                    / max(dynamic_lane_guard_same_lane_tolerance, 1e-6),
+                )
+                same_lane_factor = smoothstep(same_lane_ratio)
+                target_lane_defined = ca.if_else(ca.fabs(obs_pass_lateral) > 1e-6, 1.0, 0.0)
+                dynamic_vehicle_active = active * obs_is_vehicle * ca.if_else(
+                    obs_speed > dynamic_lane_guard_speed_threshold,
+                    1.0,
+                    0.0,
+                )
+                lane_guard_profile = dynamic_lane_guard_profile(
+                    ego_obs_long,
+                    obs_half_length,
+                )
+                lateral_sign = ca.if_else(obs_pass_lateral >= 0.0, 1.0, -1.0)
+                move_toward_target = ca.fmax(
+                    0.0,
+                    lateral_sign * ego_obs_lateral - dynamic_lane_guard_hold_margin,
+                )
+                candidate_rear = -obs_half_length
+                candidate_front = obs_half_length
+                corridor_start = ego_obs_long - ego_half_length - dynamic_lane_guard_rear_gap
+                corridor_end = candidate_front + dynamic_lane_guard_front_gap
+                corridor_norm = max(
+                    dynamic_lane_guard_rear_gap
+                    + dynamic_lane_guard_front_gap
+                    + 2.0 * ego_half_length,
+                    1e-6,
+                )
+                target_lane_block_score = 0.0
+
+                for m in range(self.max_obstacles):
+                    if m == j:
+                        continue
+                    other_active = self.Obstacles[0, m]
+                    other_x0 = self.Obstacles[1, m]
+                    other_y0 = self.Obstacles[2, m]
+                    other_half_length = self.Obstacles[5, m]
+                    other_vx = self.Obstacles[6, m]
+                    other_vy = self.Obstacles[7, m]
+                    other_is_vehicle = self.Obstacles[8, m]
+                    other_x = other_x0 + other_vx * (i * dt)
+                    other_y = other_y0 + other_vy * (i * dt)
+                    other_speed = ca.sqrt(other_vx ** 2 + other_vy ** 2 + 1e-6)
+                    other_obs_dx = other_x - obs_x
+                    other_obs_dy = other_y - obs_y
+                    other_obs_long = (
+                        other_obs_dx * obs_forward_x
+                        + other_obs_dy * obs_forward_y
+                    )
+                    other_obs_lateral = (
+                        other_obs_dx * obs_left_x
+                        + other_obs_dy * obs_left_y
+                    )
+                    lane_match_ratio = ca.fmax(
+                        0.0,
+                        1.0 - ca.fabs(other_obs_lateral - obs_pass_lateral)
+                        / max(dynamic_lane_guard_target_lane_tolerance, 1e-6),
+                    )
+                    lane_match_factor = smoothstep(lane_match_ratio)
+                    other_rear = other_obs_long - other_half_length
+                    other_front = other_obs_long + other_half_length
+                    overlap_start = ca.fmax(corridor_start, other_rear)
+                    overlap_end = ca.fmin(corridor_end, other_front)
+                    overlap = ca.fmax(0.0, overlap_end - overlap_start)
+                    target_lane_block_score += (
+                        other_active
+                        * other_is_vehicle
+                        * ca.if_else(
+                            other_speed > dynamic_lane_guard_speed_threshold,
+                            1.0,
+                            0.0,
+                        )
+                        * lane_match_factor
+                        * (overlap / corridor_norm)
+                    )
+
+                self.obj += (
+                    dynamic_vehicle_active
+                    * target_lane_defined
+                    * same_lane_factor
+                    * lane_guard_profile
+                    * dynamic_lane_guard_weight
+                    * target_lane_block_score
+                    * move_toward_target ** 2
+                ) / (i + 1)
+                lane_open_ratio = ca.fmax(0.0, 1.0 - target_lane_block_score)
+                lane_open_factor = smoothstep(lane_open_ratio)
+                desired_dynamic_lateral = obs_pass_lateral
+                lateral_progress_error = ego_obs_lateral - lane_guard_profile * desired_dynamic_lateral
+                self.obj += (
+                    dynamic_vehicle_active
+                    * target_lane_defined
+                    * same_lane_factor
+                    * lane_open_factor
+                    * dynamic_overtake_lateral_weight
+                    * lateral_progress_error ** 2
+                ) / (i + 1)
+
+            for j in range(self.max_bypass_clusters):
+                active = self.BypassClusters[0, j]
+                origin_x = self.BypassClusters[1, j]
+                origin_y = self.BypassClusters[2, j]
+                cluster_yaw = self.BypassClusters[3, j]
+                rear_s = self.BypassClusters[4, j]
+                front_s = self.BypassClusters[5, j]
+                pass_lateral = self.BypassClusters[6, j]
+                forward_x = ca.cos(cluster_yaw)
+                forward_y = ca.sin(cluster_yaw)
+                left_x = -ca.sin(cluster_yaw)
+                left_y = ca.cos(cluster_yaw)
+                dx = state_i[0] - origin_x
+                dy = state_i[1] - origin_y
+                rel_long = dx * forward_x + dy * forward_y
+                rel_lat = dx * left_x + dy * left_y
+                lateral_sign = ca.if_else(pass_lateral >= 0.0, 1.0, -1.0)
+                desired_lateral = lateral_sign * ca.if_else(
+                    ca.fabs(pass_lateral) > side_clearance,
+                    side_clearance,
+                    ca.fabs(pass_lateral),
+                )
+                lateral_error = rel_lat - desired_lateral
+                yaw_error = ca.atan2(
+                    ca.sin(state_i[2] - cluster_yaw),
+                    ca.cos(state_i[2] - cluster_yaw),
+                )
+                lateral_profile, yaw_profile = bypass_profiles(rel_long, rear_s, front_s)
+                self.obj += active * lateral_profile * side_weight * lateral_error ** 2
+                self.obj += active * yaw_profile * yaw_weight * yaw_error ** 2
+
+    def initialize_solver(self):
+        if self.solver_initialized:
+            return
+        self.solver_add_cost()
+        self.solver_add_parametric_soft_obs()
+        self.solver_add_bounds_fixed()
+        self.solver_initialized = True
+
+    def solver_add_bounds_fixed(self):
+        previous_control_diff = self.U[:, 0] - self.previous_control_param
+        self.obj += self.previous_acc_cost_weight * previous_control_diff[0] ** 2
+        self.obj += self.previous_steer_cost_weight * previous_control_diff[1] ** 2
+
+        self.g.append(self.U[:, 0] - self.previous_control_param)
+
+        for i in range(self.horizon - 1):
+            self.g.append(self.U[0, i + 1] - self.U[0, i])
+            self.g.append(self.U[1, i + 1] - self.U[1, i])
+
+        nlp_prob = {
+            'f': self.obj,
+            'x': self.opt_variables,
+            'p': self.solver_parameters,
+            'g': ca.vertcat(*self.g),
+        }
+        opts_setting = {
+            'ipopt.max_iter': self.maxiter,
+            'ipopt.print_level': 0,
+            'print_time': 0,
+            'ipopt.tol': self.ipopt_tol,
+            'ipopt.acceptable_tol': self.ipopt_acceptable_tol,
+            'ipopt.acceptable_obj_change_tol': self.ipopt_acceptable_obj_change_tol,
+            'ipopt.warm_start_init_point': 'yes',
+            'ipopt.max_cpu_time': self.ipopt_max_cpu_time,
+            'ipopt.sb': 'yes',
+        }
+        self.solver = ca.nlpsol('solver', 'ipopt', nlp_prob, opts_setting)
+        if self.fallback_maxiter > self.maxiter:
+            fallback_opts = dict(opts_setting)
+            fallback_opts['ipopt.max_iter'] = self.fallback_maxiter
+            self.solver_fallback = ca.nlpsol('solver_fallback', 'ipopt', nlp_prob, fallback_opts)
+        else:
+            self.solver_fallback = self.solver
+
+        for _ in range(self.horizon + 1):
+            for _ in range(self.n_states):
+                self.lbg.append(0.0)
+                self.ubg.append(0.0)
+
+        self.lbg.extend([-2.0, -self.first_step_steer_delta_bound])
+        self.ubg.extend([2.0, self.first_step_steer_delta_bound])
+        for _ in range(self.horizon - 1):
+            self.lbg.extend([-0.9, -self.steer_delta_bound])
+            self.ubg.extend([0.9, self.steer_delta_bound])
+
+        acc_lb = getattr(self, '_temp_acc_lbound', self.acc_lbound)
+        for _ in range(self.horizon):
+            self.lbx.extend([acc_lb, -self.steer_bound])
+            self.ubx.extend([self.acc_ubound, self.steer_bound])
+
+        if hasattr(self, '_temp_acc_lbound'):
+            delattr(self, '_temp_acc_lbound')
+
+        for _ in range(self.horizon + 1):
+            self.lbx.extend([-np.inf, -np.inf, -np.inf, -self.target_v, -np.inf, -np.inf])
+            self.ubx.extend([np.inf, np.inf, np.inf, self.target_v, np.inf, np.inf])
+
     def solver_add_soft_obs(self, obs=None, ratio=500, expn=1):
         """
-        添加软障碍物避让约束（势场法增强版）
-        
-        包含两部分：
-        1. 斥力场：距离障碍物越近惩罚越大（避免碰撞）
-        2. 吸引力：引导车辆向障碍物左侧绕行（引导方向）
-        
-        参数：
-            obs: 障碍物位置列表，每个元素 [x, y, yaw]
-            ratio: 惩罚系数
-            expn: 惩罚指数
+        添加软障碍物避让代价。
+
+        obs 每行格式：
+            [x, y, yaw_rad, radius, half_length, speed, is_vehicle, pass_lateral]
         """
         import os
-        log_dir = r"C:\Users\Administrator\Desktop\carla_MPC-main2\carla_MPC-main2\debug_logs"
+        log_dir = ensure_debug_log_dir()
         os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(log_dir, "run_debug.log")
         
@@ -616,49 +1416,213 @@ class Vehicle:
         
         obs = np.array(obs)  # 转为numpy数组
         n_obs = obs.shape[0]
-        log(f"[DEBUG solver_add_soft_obs] n_obs={n_obs}, ratio={ratio}")
-        
-        # 车辆半径（米）
-        vehicle_radius = 1.5
-        # 障碍物半径（米）
-        obst_radius = 1.68
-        
-        # ========== 经典人工势场法参数 ==========
-        R_max = 15.0  # 障碍物影响范围（米）
-        k_u = 10000.0   # 斥力增益系数
+        pass_laterals = obs[:, 7].tolist() if obs.shape[1] > 7 else []
+        log(f"[DEBUG solver_add_soft_obs] n_obs={n_obs}, ratio={ratio}, pass_laterals={pass_laterals}")
+
+        ego_radius = float(self.ego_footprint_radius)
+        ego_half_length = float(self.ego_footprint_half_length)
+        influence_dist = float(self.obstacle_influence_dist)
+        safe_dist = float(self.obstacle_safe_dist)
+        distance_weight = float(self.obstacle_cost_weight)
+        violation_weight = float(self.obstacle_violation_weight)
+        side_weight = float(self.obstacle_side_cost_weight)
+        side_clearance = float(self.obstacle_side_clearance)
+        bypass_start_distance = float(self.obstacle_bypass_start_distance)
+        bypass_full_distance = float(self.obstacle_bypass_full_distance)
+        return_front_clearance_lengths = float(self.obstacle_return_front_clearance_lengths)
+        return_distance = float(self.obstacle_return_distance)
+        cluster_gap = float(self.obstacle_cluster_gap)
+        cluster_yaw_tolerance = float(self.obstacle_cluster_yaw_tolerance)
+        cluster_lateral_tolerance = float(self.obstacle_cluster_lateral_tolerance)
+        static_speed_threshold = float(self.obstacle_static_speed_threshold)
+        yaw_weight = float(self.obstacle_parallel_yaw_weight)
+        yaw_release_distance = float(self.obstacle_yaw_release_distance)
+
+        def smoothstep(value):
+            return value * value * (3.0 - 2.0 * value)
+
+        def angle_diff(a, b):
+            return math.atan2(math.sin(a - b), math.cos(a - b))
+
+        def obstacle_value(row, index, default):
+            return float(row[index]) if obs.shape[1] > index else float(default)
+
+        def build_bypass_clusters():
+            candidates = []
+            for obs_index in range(n_obs):
+                row = obs[obs_index]
+                obs_speed = obstacle_value(row, 5, 0.0)
+                is_vehicle = obstacle_value(row, 6, 1.0)
+                pass_lateral = obstacle_value(row, 7, 0.0)
+                if is_vehicle < 0.5 or obs_speed > static_speed_threshold:
+                    continue
+                candidates.append(
+                    {
+                        "x": float(row[0]),
+                        "y": float(row[1]),
+                        "yaw": obstacle_value(row, 2, 0.0),
+                        "half_length": max(
+                            obstacle_value(row, 4, self.obstacle_longitudinal_min_half),
+                            float(self.obstacle_longitudinal_min_half),
+                        ),
+                        "pass_lateral": pass_lateral,
+                    }
+                )
+
+            clusters = []
+            for candidate in candidates:
+                merged = False
+                for cluster in clusters:
+                    if abs(angle_diff(candidate["yaw"], cluster["yaw"])) > cluster_yaw_tolerance:
+                        continue
+                    if (
+                        abs(candidate["pass_lateral"]) > 1e-6
+                        and abs(cluster["pass_lateral"]) > 1e-6
+                        and candidate["pass_lateral"] * cluster["pass_lateral"] <= 0.0
+                    ):
+                        continue
+                    forward = cluster["forward"]
+                    left = cluster["left"]
+                    dx = candidate["x"] - cluster["origin_x"]
+                    dy = candidate["y"] - cluster["origin_y"]
+                    center_s = dx * forward[0] + dy * forward[1]
+                    center_l = dx * left[0] + dy * left[1]
+                    rear_s = center_s - candidate["half_length"]
+                    front_s = center_s + candidate["half_length"]
+                    gap = max(rear_s - cluster["front_s"], cluster["rear_s"] - front_s, 0.0)
+                    if abs(center_l) > cluster_lateral_tolerance or gap > cluster_gap:
+                        continue
+                    cluster["rear_s"] = min(cluster["rear_s"], rear_s)
+                    cluster["front_s"] = max(cluster["front_s"], front_s)
+                    if abs(candidate["pass_lateral"]) > 1e-6:
+                        if abs(cluster["pass_lateral"]) <= 1e-6:
+                            cluster["pass_lateral"] = candidate["pass_lateral"]
+                        else:
+                            cluster["pass_lateral"] = math.copysign(
+                                max(abs(cluster["pass_lateral"]), abs(candidate["pass_lateral"])),
+                                cluster["pass_lateral"],
+                            )
+                    merged = True
+                    break
+
+                if not merged:
+                    forward = (math.cos(candidate["yaw"]), math.sin(candidate["yaw"]))
+                    left = (-math.sin(candidate["yaw"]), math.cos(candidate["yaw"]))
+                    clusters.append(
+                        {
+                            "origin_x": candidate["x"],
+                            "origin_y": candidate["y"],
+                            "yaw": candidate["yaw"],
+                            "forward": forward,
+                            "left": left,
+                            "rear_s": -candidate["half_length"],
+                            "front_s": candidate["half_length"],
+                            "pass_lateral": candidate["pass_lateral"],
+                        }
+                    )
+            return [cluster for cluster in clusters if abs(cluster["pass_lateral"]) > 1e-6]
+
+        bypass_clusters = build_bypass_clusters()
+        log(f"[DEBUG solver_add_soft_obs] bypass_clusters={len(bypass_clusters)}")
+
+        def bypass_profiles(rel_long, rear_s, front_s):
+            entry_start = rear_s - ego_half_length - bypass_start_distance
+            entry_full = rear_s - ego_half_length - bypass_full_distance
+            return_start = front_s + max((2.0 * return_front_clearance_lengths - 1.0) * ego_half_length, 0.0)
+            return_end = return_start + return_distance
+            yaw_return_start = front_s
+            yaw_return_end = yaw_return_start + yaw_release_distance
+            entry_ratio = (rel_long - entry_start) / max(entry_full - entry_start, 1e-6)
+            return_ratio = (rel_long - return_start) / max(return_end - return_start, 1e-6)
+            yaw_return_ratio = (rel_long - yaw_return_start) / max(yaw_return_end - yaw_return_start, 1e-6)
+            entry_shape = smoothstep(entry_ratio)
+            return_shape = 1.0 - smoothstep(return_ratio)
+            lateral_profile = ca.if_else(
+                rel_long <= entry_start,
+                0.0,
+                ca.if_else(
+                    rel_long < entry_full,
+                    entry_shape,
+                    ca.if_else(
+                        rel_long <= return_start,
+                        1.0,
+                        ca.if_else(rel_long < return_end, return_shape, 0.0),
+                    ),
+                ),
+            )
+            yaw_profile = ca.if_else(
+                rel_long <= entry_start,
+                0.0,
+                ca.if_else(
+                    rel_long < entry_full,
+                    entry_shape,
+                    ca.if_else(
+                        rel_long <= yaw_return_start,
+                        1.0,
+                        ca.if_else(rel_long < yaw_return_end, 1.0 - smoothstep(yaw_return_ratio), 0.0),
+                    ),
+                ),
+            )
+            return lateral_profile, yaw_profile
         
         for i in range(self.horizon):  # 每个预测步
-            # 获取车辆的两个圆心
             state_i = self.X[:, i]
-            (vcx1, vcy1), (vcx2, vcy2) = self.get_self_centers(state_i, vehicle_radius)
+            ego_centers = self.get_self_centers(state_i, ego_half_length)
             
             for j in range(n_obs):  # 每个障碍物
-                obs_x = obs[j, 0]
-                obs_y = obs[j, 1]
-                obs_yaw = obs[j, 2] if obs.shape[1] > 2 else 0
-                
-                # ========== 1. 经典斥力场（避免碰撞）==========
-                (ocx1, ocy1), (ocx2, ocy2) = self.get_obs_centers_simple(obs_x, obs_y, obs_yaw, obst_radius)
-                
-                d1 = ca.sqrt((vcx1 - ocx1)**2 + (vcy1 - ocy1)**2)
-                d2 = ca.sqrt((vcx1 - ocx2)**2 + (vcy1 - ocy2)**2)
-                d3 = ca.sqrt((vcx2 - ocx1)**2 + (vcy1 - ocy1)**2)
-                d4 = ca.sqrt((vcx2 - ocx2)**2 + (vcy2 - ocy2)**2)
-                
-                dist = ca.mmin(ca.vertcat(d1, d2, d3, d4))
-                
-                # 经典斥力势函数（自动具有截止特性）
-                rep_term = 1/(dist + 1) - 1/(R_max + 1)
-                rep_potential = 0.5 * k_u * rep_term**2
-                
-                # 应用到目标函数
-                self.obj += rep_potential / (i + 1)
-                
-                # ========== 2. 吸引力（暂时禁用）==========
-                # 吸引力容易把车拉向错误方向，暂时只用斥力
-                # 后续可以基于参考路径方向来决定绕行方向
+                obs_x = float(obs[j, 0])
+                obs_y = float(obs[j, 1])
+                obs_yaw = float(obs[j, 2]) if obs.shape[1] > 2 else 0.0
+                obs_radius = max(
+                    float(obs[j, 3]) if obs.shape[1] > 3 else self.obstacle_min_radius,
+                    float(self.obstacle_min_radius),
+                )
+                obs_half_length = max(
+                    float(obs[j, 4]) if obs.shape[1] > 4 else self.obstacle_longitudinal_min_half,
+                    float(self.obstacle_longitudinal_min_half),
+                )
+
+                obs_centers = self.get_obs_centers_simple(obs_x, obs_y, obs_yaw, obs_half_length)
+                for ego_center in ego_centers:
+                    for obs_center in obs_centers:
+                        dist = ca.sqrt(
+                            (ego_center[0] - obs_center[0]) ** 2
+                            + (ego_center[1] - obs_center[1]) ** 2
+                            + 1e-6
+                        )
+                        clearance = dist - ego_radius - obs_radius
+                        distance_cost = ca.if_else(
+                            clearance < influence_dist,
+                            distance_weight * (influence_dist - clearance) ** 2,
+                            0.0,
+                        )
+                        violation_cost = ca.if_else(
+                            clearance < safe_dist,
+                            violation_weight * (safe_dist - clearance) ** 2,
+                            0.0,
+                        )
+                        self.obj += (distance_cost + violation_cost) / (i + 1)
+
+            for cluster in bypass_clusters:
+                dx = state_i[0] - cluster["origin_x"]
+                dy = state_i[1] - cluster["origin_y"]
+                rel_long = dx * cluster["forward"][0] + dy * cluster["forward"][1]
+                rel_lat = dx * cluster["left"][0] + dy * cluster["left"][1]
+                lateral_profile, yaw_profile = bypass_profiles(rel_long, cluster["rear_s"], cluster["front_s"])
+                required_lateral = side_clearance
+                desired_lateral = math.copysign(
+                    min(abs(cluster["pass_lateral"]), required_lateral),
+                    cluster["pass_lateral"],
+                )
+                lateral_error = rel_lat - desired_lateral
+                yaw_error = ca.atan2(
+                    ca.sin(state_i[2] - cluster["yaw"]),
+                    ca.cos(state_i[2] - cluster["yaw"]),
+                )
+                self.obj += lateral_profile * side_weight * lateral_error ** 2
+                self.obj += yaw_profile * yaw_weight * yaw_error ** 2
         
-        log(f"[DEBUG solver_add_soft_obs] 势场法增强版惩罚项添加完成")
+        log("[DEBUG solver_add_soft_obs] safety+bypass obstacle cost added")
 
     def solver_add_bounds(self, u00=None):
         """
@@ -674,10 +1638,13 @@ class Vehicle:
             u00: 上一时刻的控制输入（用于控制平滑约束）
         """
         # ---- 添加 jerk约束（控制增量约束）----
-        if u00 is not None:
+        return self.solver_add_bounds_fixed()
+        if False:
             # 第一个控制增量约束
             self.g.append(self.U[:, 0] - u00)
         
+        self.g.append(self.U[:, 0] - self.previous_control_param)
+
         for i in range(self.horizon-1):
             # 加速度增量约束（-0.9 ~ 0.9 m/s³）
             self.g.append((self.U[0, i+1] - self.U[0, i]))
@@ -713,19 +1680,19 @@ class Vehicle:
 
         # 第一个控制增量约束（与上一时刻的连续性）
         # 【修复振荡】减小转向角增量约束
-        if u00 is not None:
-            self.lbg.append(-3)   # 加速度增量下界
-            self.lbg.append(-0.3)  # 转向角增量下界（减小）
-            self.ubg.append(3)    # 上界
-            self.ubg.append(0.3)   # 转向角增量上界（减小）
+        if False:
+            self.lbg.append(-2.0)   # 加速度增量下界
+            self.lbg.append(-0.08)  # 转向角增量下界
+            self.ubg.append(2.0)    # 加速度增量上界
+            self.ubg.append(0.08)   # 转向角增量上界
         
         # jerk约束（控制增量）
         # 【修复振荡】减小转向角增量约束，从±0.2改为±0.1 rad
         for _ in range(self.horizon-1):
             self.lbg.append(-0.9)  # 加速度增量
-            self.lbg.append(-0.1)  # 转向角增量（减小以抑制振荡）
+            self.lbg.append(-0.08)  # 转向角增量
             self.ubg.append(0.9)
-            self.ubg.append(0.1)
+            self.ubg.append(0.08)
 
         # ---- 控制输入约束 ----
         # 如果有临时刹车约束（避障时），使用宽松的刹车约束
@@ -796,7 +1763,7 @@ class Vehicle:
         
         # 调试：检查求解状态
         import os
-        log_dir = r"C:\Users\Administrator\Desktop\carla_MPC-main2\carla_MPC-main2\debug_logs"
+        log_dir = ensure_debug_log_dir()
         os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(log_dir, "run_debug.log")
         
@@ -821,7 +1788,7 @@ class Vehicle:
         else:
             return u0, x_m
 
-    def solve_MPC(self, z_ref, z0, n_states, u0):
+    def solve_MPC(self, z_ref, z0, n_states, u0, previous_control=None, obstacles=None, lane_bounds=None):
         """
         MPC求解（热启动版本）【推荐使用】
         
@@ -843,16 +1810,40 @@ class Vehicle:
         x_m = n_states
 
         # 构建参数
-        c_p = np.vstack((z0.T, xs)).T
+        if not self.solver_initialized:
+            self.initialize_solver()
+        if previous_control is None:
+            previous_control = np.array([u0[0, 0], u0[0, 1]], dtype=float)
+        c_p = self._runtime_parameters(z_ref, z0, previous_control, obstacles, lane_bounds)
         # c_p = [z0,    xs[:,0], xs[:,1], ..., xs[:,10]]，形状：(n_states, horizon+2) = (6, 12)
         #前 20 个 = 控制序列 U（拉成一列），后 66 个 = 状态序列 X（拉成一列）
         init_control = np.concatenate((u0.reshape(-1, 1), x_m.reshape(-1, 1)))
 
         # 计时并求解，把初始猜测、参考轨迹、约束边界全部打包扔给 IPOPT，求解器通过迭代优化，返回一组最优的控制序列和状态序列
         start_time = time.time()
-        res = self.solver(x0=init_control, p=c_p,
-                         lbg=self.lbg, lbx=self.lbx,
-                         ubg=self.ubg, ubx=self.ubx)
+        res = self.solver(
+            x0=init_control,
+            p=c_p,
+            lbg=self.lbg,
+            lbx=self.lbx,
+            ubg=self.ubg,
+            ubx=self.ubx,
+        )
+        stats = self.solver.stats()
+        if (
+            not bool(stats.get("success", False))
+            and self.solver_fallback is not None
+            and self.solver_fallback is not self.solver
+        ):
+            res = self.solver_fallback(
+                x0=init_control,
+                p=c_p,
+                lbg=self.lbg,
+                lbx=self.lbx,
+                ubg=self.ubg,
+                ubx=self.ubx,
+            )
+            stats = self.solver_fallback.stats()
         cost_time = time.time() - start_time
 
         #res['x'] 是求解器返回的原始解（CasADi 格式），.full() 把它转成 NumPy 密集数组，
@@ -865,6 +1856,7 @@ class Vehicle:
 
         #返回4个东西：加速度序列、转向角序列、预测状态序列、求解时间。其中第一个控制 u0[0] 就是要在这一拍实际执行的指令，
         #u0[:, 0]第0列，u0[:, 1]第1列
+        self.last_min_obstacle_clearance = self._min_obstacle_clearance(x_m, obstacles)
         if self.carla:
             return u0[:, 0], u0[:, 1], x_m, cost_time
         else:

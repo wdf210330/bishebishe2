@@ -4,16 +4,30 @@ import os
 import sys
 
 try:
-    sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
+    import carla
+except ModuleNotFoundError:
+    search_roots = []
+    for env_name in ("CARLA_PYTHONAPI_PATH", "CARLA_ROOT"):
+        value = os.environ.get(env_name)
+        if value:
+            search_roots.append(value)
+
+    egg_pattern = "carla-*%d.%d-%s.egg" % (
         sys.version_info.major,
         sys.version_info.minor,
-        'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
-except IndexError:
-    pass
+        "win-amd64" if os.name == "nt" else "linux-x86_64",
+    )
+    candidates = []
+    for root in search_roots:
+        candidates.extend(glob.glob(os.path.join(root, "PythonAPI", "carla", "dist", egg_pattern)))
+        candidates.extend(glob.glob(os.path.join(root, "dist", egg_pattern)))
+        candidates.extend(glob.glob(os.path.join(root, egg_pattern)))
 
+    if not candidates:
+        raise
 
-
-import carla
+    sys.path.append(candidates[0])
+    import carla
 from carla import ColorConverter as cc
 import argparse
 import collections
